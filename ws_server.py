@@ -660,26 +660,65 @@ async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0
         resp.say("An error occurred while processing your request.", voice="alice")
         return Response(content=str(resp), media_type="text/xml")
     
+from urllib.parse import urlencode, urlunparse, urlparse, parse_qsl
+
 @app.get("/hold")
 @app.post("/hold")
-async def hold_minimal(request: Request, convo_id: str = Query(...)):
+async def hold(request: Request, convo_id: str = Query(...)):
     """
-    Minimal deterministic TwiML for diagnosing Twilio 'application error'.
-    Returns: HTTP 200 + valid TwiML always.
+    Twilio polls /hold while background work prepares the reply.
+    When ready, Play the presigned S3 TTS URL (if reachable) or Say the text.
+    If not ready, return TwiML that pauses then redirects back to the same /hold
+    using HTTPS and a safe, encoded query string.
     """
     try:
-        logger.info("hold_minimal called; convo_id=%s; method=%s", convo_id, request.method)
+        ready = hold_store.get_ready(convo_id)
         resp = VoiceResponse()
-        # Simple, known-good TwiML
-        resp.say("This is a short test from the server. The webhook returned valid TwiML.", voice="alice")
-        # optional: put a short pause and end call (no record, no redirect)
-        resp.pause(length=1)
+
+        if ready:
+            # If ready, try to play TTS URL, else say text
+            tts_url = _unescape_url(ready.get("tts_url"))
+            if tts_url and is_url_playable(tts_url):
+                resp.play(tts_url)
+            else:
+                txt = ready.get("reply_text", "")
+                if not txt:
+                    txt = "Sorry, I don't have an answer right now."
+                resp.say(txt, voice="alice")
+            # After playing/saying the reply, record to capture more user utterances
+            resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
+
+            # Log the TwiML we're returning for debugging
+            logger.info("[%s] Returning TwiML (ready): %s", convo_id, str(resp))
+            return Response(content=str(resp), media_type="text/xml")
+
+        # Not ready -> build a safe HTTPS redirect back to /hold so Twilio polls again
+        # Use the request.base_url but force https and add a poll flag
+        base_url = str(request.base_url).rstrip("/")
+        # Force HTTPS in case request.base_url is http (Twilio expects reachable HTTPS)
+        if base_url.startswith("http://"):
+            base_url = "https://" + base_url[len("http://"):]
+        # Parse/append query params properly to avoid double-escaping & -> &amp;
+        parsed = urlparse(base_url)
+        # construct new query string with convo_id and poll=1
+        qs = urlencode({"convo_id": convo_id, "poll": "1"})
+        redirect_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path + "/hold", "", qs, ""))
+
+        resp.say("Please hold while I prepare your response.", voice="alice")
+        resp.pause(length=8)
+        # Twilio will follow the Redirect element; provide the absolute HTTPS URL we built
+        resp.redirect(redirect_url, method="GET")
+
+        # Log what TwiML is sent for debugging
+        logger.info("[%s] Returning TwiML (not ready). Redirecting to: %s TwiML: %s", convo_id, redirect_url, str(resp))
         return Response(content=str(resp), media_type="text/xml")
+
     except Exception as e:
-        # extremely defensive fallback — still always returns valid TwiML
-        logger.exception("hold_minimal unexpected error: %s", e)
-        fallback = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Unexpected error on server.</Say></Response>'
-        return Response(content=fallback, media_type="text/xml")
+        logger.exception("Hold error: %s", e)
+        resp = VoiceResponse()
+        resp.say("An error occurred.", voice="alice")
+        logger.info("[%s] Returning error TwiML: %s", convo_id if 'convo_id' in locals() else "unknown", str(resp))
+        return Response(content=str(resp), media_type="text/xml")
 # ---------------- HEALTH ----------------
 @app.get("/health")
 async def health():
