@@ -18,6 +18,9 @@ import boto3
 from fastapi import APIRouter, Request, Header, HTTPException
 from fastapi.responses import StreamingResponse
 import os, json, asyncio, requests
+# assume TWILIO_FROM is your Twilio phone (string) and logger exists
+from flask import request  # or use fastapi Request form parsing
+
 
 # Optional OpenAI client
 try:
@@ -384,6 +387,24 @@ async def twiml(request: Request):
 
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
+
+    # Example for FastAPI (inside the route function where you get request.form())
+    vals = await request.form()  # or request.form() in sync frameworks
+    recording_from = vals.get("From") or vals.get("Caller") or ""
+    direction = (vals.get("Direction") or "").lower()         # e.g. "outbound-api" or "inbound"
+    call_sid = vals.get("CallSid")
+
+    # Drop any recording that came from your own Twilio number (playback)
+    if recording_from and recording_from == TWILIO_FROM:
+        logger.info("[%s] Ignoring recording from TWILIO_FROM (playback). From=%s Direction=%s",
+                call_sid, recording_from, direction)
+        return ("", 204)
+
+    # Also ignore obvious outbound recordings
+    if direction and ("outbound" in direction or "conference" in direction):
+        logger.info("[%s] Ignoring outbound/conference recording. Direction=%s", call_sid, direction)
+        return ("", 204)
+
     form = await request.form()
     payload = dict(form)
     recording_url = payload.get("RecordingUrl")
