@@ -662,59 +662,24 @@ async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0
     
 @app.get("/hold")
 @app.post("/hold")
-async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0)):
+async def hold_minimal(request: Request, convo_id: str = Query(...)):
     """
-    Twilio will repeatedly request /hold while the background prepares the response.
-    When ready, we either <Play> the presigned S3 URL (if reachable) or <Say> the reply_text.
-    Minimal fixes:
-      - unescape S3 presigned urls (&amp; -> &)
-      - verify URL reachable before returning <Play>
-      - add a poll counter to avoid infinite redirect loops
+    Minimal deterministic TwiML for diagnosing Twilio 'application error'.
+    Returns: HTTP 200 + valid TwiML always.
     """
     try:
-        # fetch ready payload (your existing hold_store.get_ready)
-        ready = hold_store.get_ready(convo_id)
+        logger.info("hold_minimal called; convo_id=%s; method=%s", convo_id, request.method)
         resp = VoiceResponse()
-
-        # If ready -> attempt Play or Say, then record
-        if ready:
-            tts_url = _unescape_url(ready.get("tts_url") or ready.get("play_url") or "")
-            if tts_url and is_url_playable(tts_url):
-                resp.play(tts_url)
-            else:
-                # Fallback to speak text (avoid empty text)
-                txt = ready.get("reply_text", "") or "Sorry, I don't have an answer right now."
-                resp.say(txt, voice="alice")
-
-            # After playing/saying the reply, prompt for more (records again).
-            resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
-            return Response(content=str(resp), media_type="text/xml")
-
-        # Not ready -> keep caller on hold.
-        # Safety: limit number of redirects to avoid infinite loops (e.g., 12 attempts)
-        MAX_POLL = 12
-        if poll >= MAX_POLL:
-            logger.warning("[%s] hold: reached max poll attempts (%s). returning friendly message.", convo_id, poll)
-            resp.say("Sorry — we are taking too long. We will call you back shortly.", voice="alice")
-            return Response(content=str(resp), media_type="text/xml")
-
-        # Build redirect URL with incremented poll counter.
-        base = str(request.base_url).rstrip("/")
-        # ensure convo_id is URL-encoded by Twilio / your infra; keep it simple here
-        next_poll = poll + 1
-        redirect_url = f"{base}/hold?convo_id={convo_id}&poll={next_poll}"
-
-        resp.say("Please hold while I prepare your response.", voice="alice")
-        # pause for a bit, then redirect back to /hold.
-        resp.pause(length=8)
-        resp.redirect(redirect_url)
+        # Simple, known-good TwiML
+        resp.say("This is a short test from the server. The webhook returned valid TwiML.", voice="alice")
+        # optional: put a short pause and end call (no record, no redirect)
+        resp.pause(length=1)
         return Response(content=str(resp), media_type="text/xml")
-
     except Exception as e:
-        logger.exception("Hold error: %s", e)
-        resp = VoiceResponse()
-        resp.say("An error occurred.", voice="alice")
-        return Response(content=str(resp), media_type="text/xml")
+        # extremely defensive fallback — still always returns valid TwiML
+        logger.exception("hold_minimal unexpected error: %s", e)
+        fallback = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Unexpected error on server.</Say></Response>'
+        return Response(content=fallback, media_type="text/xml")
 # ---------------- HEALTH ----------------
 @app.get("/health")
 async def health():
