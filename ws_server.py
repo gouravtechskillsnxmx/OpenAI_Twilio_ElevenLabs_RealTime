@@ -20,7 +20,13 @@ from fastapi.responses import StreamingResponse
 import os, json, asyncio, requests
 # assume TWILIO_FROM is your Twilio phone (string) and logger exists
 from flask import request  # or use fastapi Request form parsing
-
+from fastapi import Request, Query
+from fastapi.responses import Response
+from twilio.twiml.voice_response import VoiceResponse
+import requests
+import html as _html
+import logging
+import urllib.parse
 
 # Optional OpenAI client
 try:
@@ -548,18 +554,19 @@ import html as _html
 import logging
 logger = logging.getLogger(__name__)
 
-def _unescape_url(url: Optional[str]) -> Optional[str]:
+def _unescape_url(url: str | None) -> str | None:
     if not url:
         return None
-    u = _html.unescape(url).strip()
-    if u.startswith('"') and u.endswith('"'):
-        u = u[1:-1]
-    return u
+    try:
+        u = _html.unescape(str(url)).strip()
+        if u.startswith('"') and u.endswith('"'):
+            u = u[1:-1]
+        return u
+    except Exception:
+        return None
 
 def is_url_playable(url: str, timeout=(2,5)) -> bool:
-    """
-    Do a small ranged GET (0-0). Accept 200 or 206.
-    """
+    """Do small ranged GET (0-0). Accept 200 or 206. Any exception -> False."""
     try:
         headers = {"Range": "bytes=0-0", "User-Agent": "hold-check/1.0"}
         r = requests.get(url, headers=headers, timeout=timeout, stream=True)
@@ -570,9 +577,89 @@ def is_url_playable(url: str, timeout=(2,5)) -> bool:
             pass
         return status in (200, 206)
     except Exception as e:
-        logger.warning("is_url_playable: ranged GET failed for %s -> %s", url, e)
+        logger.debug("is_url_playable: ranged GET failed for %s -> %s", url, e)
         return False
 
+# Keep both GET and POST because Twilio might use either
+@app.get("/hold")
+@app.post("/hold")
+async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0)):
+    """
+    Twilio polls /hold until ready.
+    Defensive behavior: always return valid TwiML, never raise out to FastAPI.
+    """
+    resp = VoiceResponse()
+    try:
+        # Attempt to read ready payload via your existing hold_store.get_ready
+        try:
+            ready = hold_store.get_ready(convo_id)
+        except Exception as e:
+            logger.warning("[%s] hold_store.get_ready failed: %s", convo_id, e)
+            ready = None
+
+        # If ready, either Play presigned URL (if verified) or Say text.
+        if ready:
+            try:
+                # try common keys that may contain a playable URL
+                candidate = ready.get("tts_url") or ready.get("play_url") or ready.get("url") or ""
+                tts_url = _unescape_url(candidate)
+            except Exception:
+                tts_url = None
+
+            played = False
+            if tts_url:
+                try:
+                    if is_url_playable(tts_url):
+                        # safe: only add <Play> if verification succeeded
+                        resp.play(tts_url)
+                        played = True
+                        logger.info("[%s] Play URL returned to Twilio: %s", convo_id, tts_url)
+                    else:
+                        logger.warning("[%s] Play URL not playable (will fallback to Say): %s", convo_id, tts_url)
+                except Exception as e:
+                    logger.exception("[%s] Unexpected error verifying/playing URL: %s", convo_id, e)
+                    played = False
+
+            if not played:
+                # Speak text fallback; avoid empty.
+                txt = (ready.get("reply_text") or ready.get("text") or "").strip()
+                if not txt:
+                    txt = "Sorry, I don't have an answer right now. We'll call you back shortly."
+                resp.say(txt, voice="alice")
+
+            # After delivering the response, keep recording for follow-up input (if your flow requires)
+            try:
+                resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
+            except Exception as e:
+                logger.warning("[%s] failed to append record element: %s", convo_id, e)
+
+            return Response(content=str(resp), media_type="text/xml")
+
+        # Not ready -> polite hold message then redirect back to /hold so Twilio polls again.
+        # Safety: prevent infinite redirect loops
+        MAX_POLL = 12
+        if poll >= MAX_POLL:
+            logger.warning("[%s] hold: reached max polls (%s). returning friendly message.", convo_id, poll)
+            resp.say("Sorry — we are taking too long. We will call you back shortly.", voice="alice")
+            return Response(content=str(resp), media_type="text/xml")
+
+        # increment poll and redirect (URL-encode convo_id)
+        next_poll = poll + 1
+        base = str(request.base_url).rstrip("/")
+        redirect_url = f"{base}/hold?convo_id={urllib.parse.quote(convo_id)}&poll={next_poll}"
+
+        resp.say("Please hold while I prepare your response.", voice="alice")
+        resp.pause(length=8)
+        resp.redirect(redirect_url)
+        return Response(content=str(resp), media_type="text/xml")
+
+    except Exception as e:
+        # ALWAYS return well-formed TwiML in case of any unexpected error
+        logger.exception("[%s] unexpected hold error: %s", convo_id, e)
+        resp = VoiceResponse()
+        resp.say("An error occurred while processing your request.", voice="alice")
+        return Response(content=str(resp), media_type="text/xml")
+    
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0)):
