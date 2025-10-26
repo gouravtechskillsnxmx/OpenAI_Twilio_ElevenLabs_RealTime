@@ -400,6 +400,12 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     direction = (vals.get("Direction") or "").lower()         # e.g. "outbound-api" or "inbound"
     call_sid = vals.get("CallSid")
 
+    rec_sid = vals.get("RecordingSid")  # however you extract form data
+    if not mark_recording_processed(rec_sid):
+        logger.info("Recording %s already processed — ignoring duplicate webhook.", rec_sid)
+        return Response(status_code=204)  # or appropriate Twilio response
+    # else process the recording
+
     # Drop any recording that came from your own Twilio number (playback)
     if recording_from and recording_from == TWILIO_FROM:
         logger.info("[%s] Ignoring recording from TWILIO_FROM (playback). From=%s Direction=%s",
@@ -439,93 +445,150 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 
 # ---------------- BACKGROUND ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
+    """
+    Background pipeline:
+      - download recording
+      - transcribe (OpenAI speech->text)
+      - call external agent for reply
+      - create/upload TTS (ElevenLabs -> s3) (best-effort)
+      - write hold_store.set_ready(payload) (always attempted; Redis/file fallback inside hold_store)
+      - if original call ended, create outbound fallback call (best-effort)
+    This implementation:
+      - uses asyncio.to_thread for blocking calls so we don't block the event loop
+      - adds a processing guard to avoid duplicate work
+      - includes a single retry for agent call and robust exception handling
+    """
     logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
+
+    # Best-effort processing guard: try to mark processing and skip if already in progress
     try:
-        url = build_download_url(recording_url)
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and "api.twilio.com" in url else None
-        try:
+        if hasattr(hold_store, "mark_processing") and hasattr(hold_store, "is_processing"):
+            try:
+                if hold_store.is_processing(call_sid):
+                    logger.info("[%s] Already processing; skipping duplicate background job.", call_sid)
+                    return
+            except Exception:
+                # If is_processing fails, continue (we don't want to block processing).
+                logger.exception("[%s] is_processing check failed; continuing.", call_sid)
+
+            try:
+                hold_store.mark_processing(call_sid)
+            except Exception:
+                logger.exception("[%s] mark_processing failed (continuing anyway).", call_sid)
+    except Exception:
+        # If hold_store API isn't present or errors, continue — processing guard is best-effort.
+        logger.debug("[%s] processing guard not available or failed; continuing.", call_sid)
+
+    tmp_path = None
+    try:
+        # 1) Download recording (blocking) in thread
+        def _download_write(url):
+            auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and "api.twilio.com" in url else None
             r = requests.get(url, auth=auth, timeout=30)
             r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            tmp.write(r.content)
+            tmp.flush()
+            tmp.close()
+            return tmp.name
+
+        try:
+            tmp_path = await asyncio.to_thread(_download_write, build_download_url(recording_url))
+            logger.info("[%s] saved recording to %s", call_sid, tmp_path)
         except Exception as e:
             logger.exception("[%s] Failed to download recording: %s", call_sid, e)
-            # set safe fallback and return
-            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            # Ensure we call set_ready so /hold won't 500 and the caller gets a friendly message.
+            try:
+                hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            except Exception:
+                logger.exception("[%s] set_ready failed after download error", call_sid)
             return
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(r.content)
-        tmp.flush()
-        tmp.close()
-        file_path = tmp.name
-        logger.info("[%s] saved recording to %s", call_sid, file_path)
-
+        # 2) Transcribe (OpenAI) - run blocking transcribe in thread
         transcript = ""
         try:
-            transcript = transcribe_with_openai(file_path)
+            transcript = await asyncio.to_thread(transcribe_with_openai, tmp_path) or ""
             logger.info("[%s] transcript: %s", call_sid, transcript)
         except Exception as e:
             logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
             transcript = ""
 
-        # cleanup audio file
-        try:
-            os.unlink(file_path)
-        except Exception:
-            pass
-
-        # Agent call - expects structured dict
-        try:
-            agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
-            reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
-            memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
-        except Exception as e:
-            logger.exception("[%s] agent call failed: %s", call_sid, e)
-            reply_text = "Sorry, I'm having trouble right now."
-            memory_writes = []
+        # 3) Call agent: retry once on transient failure (best-effort)
+        reply_text = ""
+        memory_writes = []
+        agent_max_attempts = 2
+        for attempt in range(agent_max_attempts):
+            try:
+                agent_out = await asyncio.to_thread(call_agent_and_get_reply, call_sid, transcript or " ")
+                if isinstance(agent_out, dict):
+                    reply_text = agent_out.get("reply_text", "") or ""
+                    memory_writes = agent_out.get("memory_writes", []) or []
+                else:
+                    reply_text = str(agent_out) or ""
+                break
+            except requests.exceptions.ReadTimeout as e:
+                logger.warning("[%s] Agent attempt %d timed out: %s", call_sid, attempt + 1, e)
+                if attempt + 1 < agent_max_attempts:
+                    await asyncio.sleep(1.0)  # backoff before retry
+                    continue
+                else:
+                    logger.exception("[%s] Agent failed after retries", call_sid)
+                    reply_text = "Sorry, I'm having trouble right now."
+                    memory_writes = []
+            except Exception as e:
+                logger.exception("[%s] agent call failed: %s", call_sid, e)
+                reply_text = "Sorry, I'm having trouble right now."
+                memory_writes = []
+                break
 
         logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
 
-        # If agent returned memory writes, persist them (best-effort)
+        # Persist memory writes (best-effort)
         if memory_writes and isinstance(memory_writes, list):
             for mw in memory_writes:
                 try:
                     if callable(write_fact):
-                        write_fact(mw)
+                        await asyncio.to_thread(write_fact, mw)
                 except Exception:
                     logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
 
-        # TTS via ElevenLabs and S3 upload. If TTS not available/failed, tts_url will be None.
+        # 4) TTS generation and upload (best-effort). If ElevenLabs fails (401) or upload fails,
+        #    we fall back to reply_text (Say) rather than crash.
         tts_url = None
         try:
-            candidate = create_and_upload_tts(reply_text)
-            # unescape (in case S3 presigned URL contains &amp;)
+            candidate = await asyncio.to_thread(create_and_upload_tts, reply_text)
             candidate_unescaped = _unescape_url(candidate) if candidate else None
-            if candidate_unescaped and is_url_playable(candidate_unescaped):
+            if candidate_unescaped and await asyncio.to_thread(is_url_playable, candidate_unescaped):
                 tts_url = candidate_unescaped
                 logger.info("[%s] tts_url: %s", call_sid, tts_url)
             else:
                 if candidate:
                     logger.warning("[%s] Created TTS but URL not playable; falling back to text reply", call_sid)
                 tts_url = None
+        except requests.exceptions.HTTPError as he:
+            # e.g., ElevenLabs 401: fall back to text
+            logger.exception("[%s] TTS generation/upload failed (HTTP error): %s", call_sid, he)
+            tts_url = None
         except Exception as e:
             logger.exception("[%s] TTS generation/upload failed: %s", call_sid, e)
             tts_url = None
 
-        # persist hold payload
+        # 5) Persist hold payload (Redis or file fallback inside hold_store)
+        payload = {"tts_url": tts_url, "reply_text": reply_text}
         try:
-            hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
+            hold_store.set_ready(call_sid, payload)
             logger.info("[%s] Hold ready", call_sid)
         except Exception:
-            logger.exception("[%s] Failed to set hold ready", call_sid)
+            logger.exception("[%s] Failed to set hold ready (set_ready failed)", call_sid)
+            # still continue; /hold will handle absence by telling caller to wait or fallback
 
-        # If call has ended by now, create fallback outbound call to play response (best-effort).
+        # 6) If call ended, create fallback outbound call to play response (best-effort)
         try:
             if twilio_client and from_number:
                 call = twilio_client.calls(call_sid).fetch()
                 status = getattr(call, "status", "").lower()
                 if status not in ("in-progress", "queued", "ringing"):
-                    # call ended, create outbound fallback to play the reply
-                    twiml = None
+                    # call ended -> create outbound fallback
                     if tts_url:
                         twiml = f"<Response><Play>{tts_url}</Play></Response>"
                     else:
@@ -537,15 +600,30 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                     except Exception:
                         logger.exception("[%s] Failed creating fallback outbound call", call_sid)
         except Exception:
-            # non-fatal
-            pass
+            logger.exception("[%s] Error while checking call status / creating fallback call", call_sid)
 
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
-        hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
+        try:
+            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
+        except Exception:
+            logger.exception("[%s] set_ready failed in unexpected-exception handler", call_sid)
+    finally:
+        # cleanup temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        # clear processing flag (best-effort)
+        try:
+            if hasattr(hold_store, "clear_processing"):
+                hold_store.clear_processing(call_sid)
+        except Exception:
+            logger.exception("[%s] clear_processing failed (best-effort).", call_sid)
 
 # ---------------- HOLD ----------------
-
 from fastapi import Request, Query
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse
@@ -579,105 +657,122 @@ def is_url_playable(url: str, timeout=(2,5)) -> bool:
     except Exception as e:
         logger.debug("is_url_playable: ranged GET failed for %s -> %s", url, e)
         return False
+# Put these near the top of ws_server.py with your other imports
+import json
+import pathlib
+import time
+from collections import OrderedDict
+from urllib.parse import urlencode, urlparse, urlunparse
 
-# Keep both GET and POST because Twilio might use either
-@app.get("/hold")
-@app.post("/hold")
-async def hold(request: Request, convo_id: str = Query(...), poll: int = Query(0)):
+# --- CONFIG ---
+HOLD_FILE_DIR = pathlib.Path("/tmp/hold_store")
+HOLD_FILE_DIR.mkdir(parents=True, exist_ok=True)
+HOLD_FALLBACK_EXPIRY = 300  # seconds to keep file fallback before consider stale
+
+# in-memory small LRU cache for processed recording SIDs to avoid duplicates
+_PROCESSED_RECORDINGS = OrderedDict()
+_PROCESSED_RECORDINGS_MAX = 1000
+def mark_recording_processed(rec_sid: str) -> bool:
+    """Return True if newly marked; return False if already processed."""
+    if not rec_sid:
+        return True
+    if rec_sid in _PROCESSED_RECORDINGS:
+        # move to end (recent)
+        _PROCESSED_RECORDINGS.move_to_end(rec_sid)
+        return False
+    _PROCESSED_RECORDINGS[rec_sid] = time.time()
+    while len(_PROCESSED_RECORDINGS) > _PROCESSED_RECORDINGS_MAX:
+        _PROCESSED_RECORDINGS.popitem(last=False)
+    return True
+
+# --- resilient hold store accessors (use these instead of direct redis.get/set) ---
+def hold_set_ready(convo_id: str, payload: dict, expire: int = 600):
     """
-    Twilio polls /hold until ready.
-    Defensive behavior: always return valid TwiML, never raise out to FastAPI.
+    Try Redis set with expiry; on Redis error fall back to writing a local JSON file.
+    Always swallow exceptions — caller can assume operation attempted.
     """
-    resp = VoiceResponse()
     try:
-        # Attempt to read ready payload via your existing hold_store.get_ready
-        try:
-            ready = hold_store.get_ready(convo_id)
-        except Exception as e:
-            logger.warning("[%s] hold_store.get_ready failed: %s", convo_id, e)
-            ready = None
-
-        # If ready, either Play presigned URL (if verified) or Say text.
-        if ready:
-            try:
-                # try common keys that may contain a playable URL
-                candidate = ready.get("tts_url") or ready.get("play_url") or ready.get("url") or ""
-                tts_url = _unescape_url(candidate)
-            except Exception:
-                tts_url = None
-
-            played = False
-            if tts_url:
-                try:
-                    if is_url_playable(tts_url):
-                        # safe: only add <Play> if verification succeeded
-                        resp.play(tts_url)
-                        played = True
-                        logger.info("[%s] Play URL returned to Twilio: %s", convo_id, tts_url)
-                    else:
-                        logger.warning("[%s] Play URL not playable (will fallback to Say): %s", convo_id, tts_url)
-                except Exception as e:
-                    logger.exception("[%s] Unexpected error verifying/playing URL: %s", convo_id, e)
-                    played = False
-
-            if not played:
-                # Speak text fallback; avoid empty.
-                txt = (ready.get("reply_text") or ready.get("text") or "").strip()
-                if not txt:
-                    txt = "Sorry, I don't have an answer right now. We'll call you back shortly."
-                resp.say(txt, voice="alice")
-
-            # After delivering the response, keep recording for follow-up input (if your flow requires)
-            try:
-                resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
-            except Exception as e:
-                logger.warning("[%s] failed to append record element: %s", convo_id, e)
-
-            return Response(content=str(resp), media_type="text/xml")
-
-        # Not ready -> polite hold message then redirect back to /hold so Twilio polls again.
-        # Safety: prevent infinite redirect loops
-        MAX_POLL = 12
-        if poll >= MAX_POLL:
-            logger.warning("[%s] hold: reached max polls (%s). returning friendly message.", convo_id, poll)
-            resp.say("Sorry — we are taking too long. We will call you back shortly.", voice="alice")
-            return Response(content=str(resp), media_type="text/xml")
-
-        # increment poll and redirect (URL-encode convo_id)
-        next_poll = poll + 1
-        base = str(request.base_url).rstrip("/")
-        redirect_url = f"{base}/hold?convo_id={urllib.parse.quote(convo_id)}&poll={next_poll}"
-
-        resp.say("Please hold while I prepare your response.", voice="alice")
-        resp.pause(length=8)
-        resp.redirect(redirect_url)
-        return Response(content=str(resp), media_type="text/xml")
-
+        if redis_client:
+            redis_client.set(f"hold:{convo_id}", json.dumps(payload), ex=expire)
+            logger.info("Redis set OK for hold:%s", convo_id)
+            return
     except Exception as e:
-        # ALWAYS return well-formed TwiML in case of any unexpected error
-        logger.exception("[%s] unexpected hold error: %s", convo_id, e)
-        resp = VoiceResponse()
-        resp.say("An error occurred while processing your request.", voice="alice")
-        return Response(content=str(resp), media_type="text/xml")
-    
-from urllib.parse import urlencode, urlunparse, urlparse, parse_qsl
+        logger.warning("Redis set failed for hold:%s -- falling back. Error: %s", convo_id, e)
+
+    # fallback: write file with timestamp
+    try:
+        data = dict(payload)
+        data["_fallback_ts"] = int(time.time())
+        p = HOLD_FILE_DIR.joinpath(f"{convo_id}.json")
+        p.write_text(json.dumps(data))
+        logger.info("File fallback: wrote %s", str(p))
+    except Exception as e:
+        logger.exception("Failed to write file fallback for hold:%s -> %s", convo_id, e)
+
+
+def hold_get_ready(convo_id: str) -> Optional[dict]:
+    """
+    Try Redis get; on error or missing, try file fallback.
+    Return dict or None. NEVER raise.
+    """
+    try:
+        if redis_client:
+            v = redis_client.get(f"hold:{convo_id}")
+            if v:
+                try:
+                    if isinstance(v, bytes):
+                        v = v.decode("utf-8")
+                    return json.loads(v)
+                except Exception:
+                    logger.exception("Failed to parse redis value for hold:%s", convo_id)
+    except Exception as e:
+        logger.warning("Redis get failed for hold:%s. Error: %s", convo_id, e)
+
+    # file fallback
+    try:
+        p = HOLD_FILE_DIR.joinpath(f"{convo_id}.json")
+        if p.exists():
+            s = p.read_text()
+            data = json.loads(s)
+            # if stale, ignore
+            ts = data.get("_fallback_ts", 0)
+            if int(time.time()) - int(ts) > HOLD_FALLBACK_EXPIRY:
+                logger.info("Hold file fallback stale for %s (ts=%s)", convo_id, ts)
+                return None
+            logger.info("In-memory/file fallback: popped hold for %s", convo_id)
+            # optionally delete after read:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+            return data
+    except Exception:
+        logger.exception("File fallback read failed for hold:%s", convo_id)
+
+    return None
+
+
+# --- safe /hold endpoint (replace your existing hold) ---
+from twilio.twiml.voice_response import VoiceResponse
 
 @app.get("/hold")
 @app.post("/hold")
-async def hold(request: Request, convo_id: str = Query(...)):
+async def hold(request: Request, convo_id: str = Query(...), poll: Optional[str] = Query(None)):
     """
-    Twilio polls /hold while background work prepares the reply.
-    When ready, Play the presigned S3 TTS URL (if reachable) or Say the text.
-    If not ready, return TwiML that pauses then redirects back to the same /hold
-    using HTTPS and a safe, encoded query string.
+    Twilio polls /hold while background prepares the response.
+    This is defensive: never raise, always return TwiML; uses hold_get_ready() wrapper.
     """
     try:
-        ready = hold_store.get_ready(convo_id)
+        ready = hold_get_ready(convo_id)
         resp = VoiceResponse()
 
         if ready:
-            # If ready, try to play TTS URL, else say text
-            tts_url = _unescape_url(ready.get("tts_url"))
+            # ready: try to play an unescaped URL first, otherwise say fallback text
+            tts_url = ready.get("tts_url") or ready.get("play_url") or None
+            if tts_url:
+                # unescape common HTML entities just in case
+                import html as _html
+                tts_url = _html.unescape(tts_url)
             if tts_url and is_url_playable(tts_url):
                 resp.play(tts_url)
             else:
@@ -685,40 +780,39 @@ async def hold(request: Request, convo_id: str = Query(...)):
                 if not txt:
                     txt = "Sorry, I don't have an answer right now."
                 resp.say(txt, voice="alice")
-            # After playing/saying the reply, record to capture more user utterances
+            # After playing/speaking the reply, record for follow-up input
+            # Use action=recording_callback_url() so Twilio will hit /recording when done
             resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
-
-            # Log the TwiML we're returning for debugging
             logger.info("[%s] Returning TwiML (ready): %s", convo_id, str(resp))
             return Response(content=str(resp), media_type="text/xml")
 
-        # Not ready -> build a safe HTTPS redirect back to /hold so Twilio polls again
-        # Use the request.base_url but force https and add a poll flag
-        base_url = str(request.base_url).rstrip("/")
-        # Force HTTPS in case request.base_url is http (Twilio expects reachable HTTPS)
-        if base_url.startswith("http://"):
-            base_url = "https://" + base_url[len("http://"):]
-        # Parse/append query params properly to avoid double-escaping & -> &amp;
-        parsed = urlparse(base_url)
-        # construct new query string with convo_id and poll=1
+        # Not ready -> keep caller on hold with a short pause and redirect back to /hold via HTTPS
+        base = str(request.base_url).rstrip("/")
+        # Guarantee HTTPS scheme for redirect (avoid http that may be blocked)
+        if base.startswith("http://"):
+            base = "https://" + base[len("http://"):]
+        parsed = urlparse(base)
         qs = urlencode({"convo_id": convo_id, "poll": "1"})
-        redirect_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path + "/hold", "", qs, ""))
+        # ensure path ends with /hold (some base_url may already include path)
+        path = parsed.path.rstrip("/") + "/hold"
+        redirect_url = urlunparse((parsed.scheme, parsed.netloc, path, "", qs, ""))
 
         resp.say("Please hold while I prepare your response.", voice="alice")
-        resp.pause(length=8)
-        # Twilio will follow the Redirect element; provide the absolute HTTPS URL we built
+        # Lower pause length to be more realtime: 4 seconds (tweakable)
+        resp.pause(length=4)
         resp.redirect(redirect_url, method="GET")
 
-        # Log what TwiML is sent for debugging
-        logger.info("[%s] Returning TwiML (not ready). Redirecting to: %s TwiML: %s", convo_id, redirect_url, str(resp))
+        logger.info("[%s] Returning TwiML (not ready). Redirect: %s TwiML: %s", convo_id, redirect_url, str(resp))
         return Response(content=str(resp), media_type="text/xml")
 
     except Exception as e:
-        logger.exception("Hold error: %s", e)
+        # Must never return 500 - fallback friendly TwiML
+        logger.exception("Hold error (unexpected): %s", e)
         resp = VoiceResponse()
-        resp.say("An error occurred.", voice="alice")
-        logger.info("[%s] Returning error TwiML: %s", convo_id if 'convo_id' in locals() else "unknown", str(resp))
+        resp.say("Sorry — an application error occurred. Please try again later.", voice="alice")
+        # do not record in error path
         return Response(content=str(resp), media_type="text/xml")
+
 # ---------------- HEALTH ----------------
 @app.get("/health")
 async def health():
