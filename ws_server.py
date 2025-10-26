@@ -213,6 +213,40 @@ def hold_clear(convo_id: str):
         pass
 
 
+# ---------------- Compatibility wrappers (added) ----------------
+def set_ready(convo_id: str, payload: dict, expire: int = 600):
+    """
+    Backwards-compatible alias to persist hold payload.
+    Use this if other modules expect set_ready(...) name.
+    """
+    try:
+        return hold_set_ready(convo_id, payload, expire=expire)
+    except Exception:
+        # never raise from wrapper
+        logger.exception("set_ready wrapper failed for %s", convo_id)
+
+
+def get_ready(convo_id: str) -> Optional[dict]:
+    """
+    Backwards-compatible alias to read hold payload.
+    """
+    try:
+        return hold_get_ready(convo_id)
+    except Exception:
+        logger.exception("get_ready wrapper error for %s", convo_id)
+        return None
+
+
+def clear_ready(convo_id: str):
+    """
+    Backwards-compatible alias to clear hold payload.
+    """
+    try:
+        return hold_clear(convo_id)
+    except Exception:
+        logger.exception("clear_ready wrapper error for %s", convo_id)
+
+
 # ---------------- helpers ----------------
 def recording_callback_url() -> str:
     if HOSTNAME:
@@ -246,10 +280,15 @@ def _unescape_url(u: Optional[str]) -> Optional[str]:
 
 
 def is_url_playable(url: Optional[str], timeout=(3, 8)) -> bool:
-    """Ranged GET check for audio URL. Accept 200 or 206. Any exception -> False."""
+    """Ranged GET check for audio URL. Accept 200 or 206. Any exception -> False.
+
+    Important: unescape HTML entities before checking (S3 presigned URLs sometimes arrive with &amp;).
+    """
     if not url:
         return False
     try:
+        # unescape any HTML entities (fix &amp; -> &)
+        url = _unescape_url(url)
         headers = {"Range": "bytes=0-0", "User-Agent": "hold-check/1.0"}
         r = requests.get(url, headers=headers, timeout=timeout, stream=True)
         status = getattr(r, "status_code", None)
@@ -370,7 +409,6 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
     tmp_path = None
     try:
         # avoid re-processing same recording
-        # Twilio sends RecordingSid in webhook; we try to use CallSid here (best-effort); caller should pass RecordingSid if available.
         if not mark_recording_processed(call_sid):
             logger.info("[%s] Recording already processed in this process, skipping.", call_sid)
             return
@@ -507,7 +545,7 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
             recording_url = form.get("RecordingUrl") or form.get("recording_url")
 
         # ensure background job runs (non-blocking)
-        # Use a sane key for dedupe: prefer RecordingSid if present
+        # Use recordingSid if present for dedupe
         rec_sid = form.get("RecordingSid") or convo_id
 
         # run processing async (fire & forget)
