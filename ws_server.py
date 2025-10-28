@@ -53,7 +53,7 @@ app = FastAPI()
 
 # --- paste below into ws_server.py ---
 
-from fastapi import Request, Response, Query
+from fastapi import  Response, Query
 from twilio.twiml.voice_response import VoiceResponse
 import html
 import json
@@ -63,6 +63,167 @@ from typing import Optional
 # in-memory fallback hold-store (thread-safe)
 _in_memory_hold = {}
 _in_memory_lock = threading.Lock()
+
+
+from fastapi import Request, Form
+from fastapi.responses import Response
+from twilio.twiml.voice_response import VoiceResponse
+import asyncio
+
+async def process_recording_background(call_sid: str, recording_url: str, from_number: str = None):
+    """
+    Background pipeline:
+    1. Download Twilio recording
+    2. Transcribe audio -> text
+    3. Send text to Agent or OpenAI
+    4. Generate TTS or fallback to text
+    5. Save 'ready' payload in hold_store
+    """
+
+    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
+    transcript = ""
+    reply_text = ""
+    tts_url = None
+
+    try:
+        # Step 1: Download recording
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if "api.twilio.com" in recording_url else None
+        r = requests.get(recording_url, auth=auth, timeout=30)
+        r.raise_for_status()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(r.content)
+        tmp.flush()
+        tmp.close()
+        audio_path = tmp.name
+        logger.info("[%s] saved recording to %s", call_sid, audio_path)
+
+        # Step 2: Transcribe audio with OpenAI Whisper
+        with open(audio_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f
+            )
+        transcript = result.text.strip()
+        logger.info("[%s] transcript: %s", call_sid, transcript)
+
+        # Step 3: Call Agent or fallback to OpenAI Chat
+        try:
+            payload = {"convo_id": call_sid, "text": transcript}
+            headers = {"Content-Type": "application/json"}
+            if os.getenv("AGENT_API_KEY"):
+                headers["Authorization"] = f"Bearer {os.getenv('AGENT_API_KEY')}"
+            r2 = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=20)
+            if r2.ok:
+                data = r2.json()
+                reply_text = data.get("reply_text") or data.get("message") or ""
+            else:
+                logger.warning("[%s] Agent response not OK (%s): %s", call_sid, r2.status_code, r2.text)
+        except Exception as e:
+            logger.warning("[%s] Agent endpoint failed (%s); fallback to OpenAI", call_sid, e)
+
+        if not reply_text:
+            # Fallback to OpenAI ChatCompletion
+            chat = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful voice assistant."},
+                    {"role": "user", "content": transcript}
+                ],
+            )
+            reply_text = chat.choices[0].message.content.strip()
+        logger.info("[%s] assistant reply: %s", call_sid, reply_text[:200])
+
+        # Step 4: Generate TTS (ElevenLabs or fallback)
+        audio_bytes = None
+        if ELEVEN_API_KEY and ELEVEN_VOICE:
+            try:
+                tts_url_eleven = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
+                rtts = requests.post(
+                    tts_url_eleven,
+                    headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg"},
+                    json={"text": reply_text, "model_id": "eleven_turbo_v2"},
+                    timeout=20,
+                )
+                if rtts.ok:
+                    audio_bytes = rtts.content
+                    # Save locally for now (you can replace this with S3 upload)
+                    tts_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                    tts_file.write(audio_bytes)
+                    tts_file.flush()
+                    tts_file.close()
+                    tts_url = f"/tmp/{os.path.basename(tts_file.name)}"  # Simplified local reference
+                else:
+                    logger.warning("[%s] ElevenLabs TTS failed (%s)", call_sid, rtts.status_code)
+            except Exception as e:
+                logger.warning("[%s] ElevenLabs TTS error: %s", call_sid, e)
+
+        # Step 5: Fallback TTS (OpenAI if ElevenLabs fails)
+        if not tts_url:
+            try:
+                speech = client.audio.speech.create(
+                    model="gpt-4o-mini-tts",
+                    voice="alloy",
+                    input=reply_text
+                )
+                tts_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                speech.stream_to_file(tts_file.name)
+                tts_url = f"/tmp/{os.path.basename(tts_file.name)}"
+                logger.info("[%s] Generated fallback TTS", call_sid)
+            except Exception as e:
+                logger.warning("[%s] Fallback TTS failed: %s", call_sid, e)
+
+        # Step 6: Mark ready for /hold endpoint
+        hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
+        logger.info("[%s] Hold ready (tts_url=%s)", call_sid, tts_url)
+
+    except Exception as e:
+        logger.exception("[%s] process_recording_background failed: %s", call_sid, e)
+        hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong while processing your request."})
+
+    finally:
+        # cleanup local file
+        try:
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+        except Exception:
+            pass
+
+@app.post("/recording")
+async def recording_webhook(
+    request: Request,
+    call_sid: str = Form(..., alias="CallSid"),
+    from_number: str = Form(None, alias="From"),
+    recording_url: str = Form(..., alias="RecordingUrl"),
+):
+    """
+    Twilio recording webhook.
+
+    Notes:
+    - We use `alias` so incoming form fields CallSid/From/RecordingUrl map correctly.
+    - We schedule the processing in the background so we return TwiML immediately.
+    - If `process_recording_background` is synchronous (blocking), we run it in a thread to avoid blocking the event loop.
+    """
+
+    logger.info("Recording webhook: CallSid=%s From=%s RecordingUrl=%s", call_sid, from_number, recording_url)
+
+    # pick the worker function and schedule it safely
+    try:
+        # If process_recording_background is async (async def), schedule directly:
+        if asyncio.iscoroutinefunction(process_recording_background):
+            asyncio.create_task(process_recording_background(call_sid, recording_url, from_number))
+        else:
+            # It's a blocking / sync function — run in a thread to avoid blocking the event loop.
+            asyncio.create_task(asyncio.to_thread(process_recording_background, call_sid, recording_url, from_number))
+    except Exception as e:
+        logger.exception("[%s] Failed to schedule background task: %s", call_sid, e)
+
+    # Immediate TwiML reply so Twilio is happy and will poll /hold
+    resp = VoiceResponse()
+    resp.say("Got it. Please hold while I prepare your response.", voice="alice")
+    # redirect caller into the /hold polling flow we already implemented
+    base = str(request.base_url).rstrip("/")
+    resp.redirect(f"{base}/hold?convo_id={call_sid}")
+    return Response(content=str(resp), media_type="text/xml")
 
 def _try_get_ready(convo_id: str) -> Optional[dict]:
     """
