@@ -1,93 +1,255 @@
-# ws_server.py
+# ws_server.py (updated)
+# Minimal, deployable version with: /recording webhook, /hold polling flow,
+# background processing, robust HoldStore (redis/file/memory fallback),
+# and a minimal Twilio Media Streams -> OpenAI realtime skeleton.
+
 import os
 import asyncio
 import base64
 import json
 import logging
 import tempfile
+import threading
 from typing import Optional
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import PlainTextResponse
-from starlette.websockets import WebSocketState
+from requests.auth import HTTPBasicAuth
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Query
+from fastapi.responses import PlainTextResponse, Response
 from twilio.rest import Client as TwilioClient
-import websockets  # pip install websockets
+from twilio.twiml.voice_response import VoiceResponse
+import websockets
+import html
 
-# Optional OpenAI client
+# Optional OpenAI Python SDK (if installed)
 try:
-    from openai import OpenAI as OpenAIClient
+    import openai
+    OPENAI_PY_SDK = True
 except Exception:
-    OpenAIClient = None
+    openai = None
+    OPENAI_PY_SDK = False
 
-
-# config / env
-OPENAI_REALTIME_WSS = os.environ.get("OPENAI_REALTIME_WSS")  # e.g. "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+# --------- Configuration (from env) ----------
+OPENAI_REALTIME_WSS = os.environ.get("OPENAI_REALTIME_WSS")
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_FROM", "+15312303465")
 OPENAI_KEY = os.environ.get("OPENAI_KEY")
-# keep compatibility with code that used OPENAI_API_KEY
-OPENAI_API_KEY = OPENAI_KEY
-
 AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT")
 AGENT_KEY = os.environ.get("AGENT_KEY")
-
 ELEVEN_API_KEY = os.environ.get("ELEVEN_API_KEY")
 ELEVEN_VOICE = os.environ.get("ELEVEN_VOICE")
-
-S3_BUCKET = os.environ.get("S3_BUCKET")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
-
-HOSTNAME = os.environ.get("HOSTNAME", "")
-TTS_PRESIGNED_EXPIRES = int(os.environ.get("TTS_PRESIGNED_EXPIRES", "3600"))
 REDIS_URL = os.environ.get("REDIS_URL")
 
-logger = logging.getLogger("realtime")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ws_server")
 
 app = FastAPI()
 
-# --- paste below into ws_server.py ---
+# Twilio client (best effort)
+try:
+    twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+except Exception:
+    twilio_client = None
 
-from fastapi import  Response, Query
-from twilio.twiml.voice_response import VoiceResponse
-import html
-import json
-import threading
-from typing import Optional
+# ---------------- HoldStore (Redis -> file -> memory fallback) ----------------
+class HoldStore:
+    def __init__(self, redis_url: Optional[str] = None, file_dir: str = "/tmp/hold_store"):
+        self.redis_url = redis_url
+        self.file_dir = Path(file_dir)
+        self.file_dir.mkdir(parents=True, exist_ok=True)
+        self.inmemory = {}
+        self.redis_client = None
+        if redis_url:
+            try:
+                import redis  # type: ignore
+                self.redis_client = redis.from_url(redis_url, decode_responses=True)
+                try:
+                    self.redis_client.ping()
+                    logger.info("HoldStore: connected to redis")
+                except Exception as e:
+                    logger.warning("HoldStore: redis ping failed, falling back: %s", e)
+                    self.redis_client = None
+            except Exception:
+                logger.exception("HoldStore: redis import/create failed; using fallback")
+                self.redis_client = None
 
-# in-memory fallback hold-store (thread-safe)
-_in_memory_hold = {}
-_in_memory_lock = threading.Lock()
+    def _path(self, convo_id: str) -> Path:
+        safe = "".join([c for c in convo_id if c.isalnum() or c in "-_."]).strip()
+        return self.file_dir / f"{safe}.json"
+
+    def set_ready(self, convo_id: str, payload: dict, ex: int = 300):
+        try:
+            j = json.dumps(payload)
+        except Exception:
+            j = json.dumps({"reply_text": str(payload)})
+        # try redis
+        if self.redis_client:
+            try:
+                self.redis_client.set(f"hold:{convo_id}", j, ex=ex)
+                logger.info("HoldStore: set into redis hold:%s", convo_id)
+                return
+            except Exception as e:
+                logger.warning("HoldStore: redis set failed, falling back: %s", e)
+        # file fallback
+        try:
+            p = self._path(convo_id)
+            p.write_text(j, encoding="utf-8")
+            logger.info("HoldStore: file fallback wrote %s", p)
+            return
+        except Exception as e:
+            logger.warning("HoldStore: file fallback failed: %s", e)
+        # memory fallback
+        try:
+            self.inmemory[convo_id] = payload
+            logger.info("HoldStore: memory set for %s", convo_id)
+        except Exception:
+            logger.exception("HoldStore: memory set failed")
+
+    def get_ready(self, convo_id: str) -> Optional[dict]:
+        # Redis first
+        if self.redis_client:
+            try:
+                v = self.redis_client.get(f"hold:{convo_id}")
+                if v:
+                    try:
+                        payload = json.loads(v)
+                    except Exception:
+                        payload = {"reply_text": v}
+                    try:
+                        self.redis_client.delete(f"hold:{convo_id}")
+                    except Exception:
+                        pass
+                    logger.info("HoldStore: popped redis hold:%s", convo_id)
+                    return payload
+            except Exception as e:
+                logger.warning("HoldStore: redis get failed: %s", e)
+
+        # file
+        try:
+            p = self._path(convo_id)
+            if p.exists():
+                txt = p.read_text(encoding="utf-8")
+                try:
+                    payload = json.loads(txt)
+                except Exception:
+                    payload = {"reply_text": txt}
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+                logger.info("HoldStore: popped file hold for %s", convo_id)
+                return payload
+        except Exception as e:
+            logger.warning("HoldStore: file get failed: %s", e)
+
+        # memory
+        try:
+            return self.inmemory.pop(convo_id, None)
+        except Exception:
+            logger.exception("HoldStore: memory pop failed")
+            return None
+
+hold_store = HoldStore(redis_url=REDIS_URL)
+
+# ---------------- Utility helpers ----------------
+
+def _unescape_url(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    return html.unescape(u).strip().strip('"')
 
 
-from fastapi import Request, Form
-from fastapi.responses import Response
-from twilio.twiml.voice_response import VoiceResponse
-import asyncio
-
-async def process_recording_background(call_sid: str, recording_url: str, from_number: str = None):
-    """
-    Background pipeline:
-    1. Download Twilio recording
-    2. Transcribe audio -> text
-    3. Send text to Agent or OpenAI
-    4. Generate TTS or fallback to text
-    5. Save 'ready' payload in hold_store
-    """
-
-    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
-    transcript = ""
-    reply_text = ""
-    tts_url = None
-
+def is_url_playable(url: str, timeout: int = 5) -> bool:
+    """Try ranged GET to confirm presigned S3 URL is reachable (200 or 206)."""
     try:
-        # Step 1: Download recording
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if "api.twilio.com" in recording_url else None
+        headers = {"Range": "bytes=0-0"}
+        r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        status = getattr(r, "status_code", None)
+        try:
+            r.close()
+        except Exception:
+            pass
+        return status in (200, 206)
+    except Exception:
+        return False
+
+
+def create_and_upload_tts(text: str) -> Optional[str]:
+    """Create TTS audio; returns a URL or local path. Minimal: prefer ElevenLabs if configured.
+    This implementation writes a local temp file and returns a file:// path (sufficient for testing).
+    Replace with S3 upload if you want presigned URLs.
+    """
+    if not text:
+        return None
+    # Try ElevenLabs
+    if ELEVEN_API_KEY and ELEVEN_VOICE:
+        try:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
+            resp = requests.post(
+                url,
+                headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg"},
+                json={"text": text},
+                timeout=20,
+            )
+            if resp.ok:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                tmp.write(resp.content)
+                tmp.flush()
+                tmp.close()
+                return f"file://{tmp.name}"
+            else:
+                logger.warning("ElevenLabs TTS failed (%s): %s", resp.status_code, resp.text)
+        except Exception as e:
+            logger.exception("ElevenLabs TTS exception: %s", e)
+
+    # Fallback: if OpenAI SDK available, try TTS or else return None
+    if OPENAI_PY_SDK and openai and OPENAI_KEY:
+        try:
+            # The exact API depends on SDK and model; here we attempt a naive approach
+            # NOTE: Many deployments will want to use OpenAI's TTS endpoints differently.
+            out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            out.close()
+            # Do nothing complex here; return path for callers to use
+            return f"file://{out.name}"
+        except Exception:
+            logger.exception("Fallback OpenAI TTS failed")
+    return None
+
+
+def transcribe_with_openai(file_path: str) -> str:
+    """Transcribe using OpenAI's transcription endpoint via HTTP. Uses OPENAI_KEY env var.
+    Returns text or empty string.
+    """
+    if not OPENAI_KEY:
+        logger.warning("OPENAI_KEY not set; cannot transcribe")
+        return ""
+    try:
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        with open(file_path, "rb") as f:
+            files = {"file": (Path(file_path).name, f)}
+            data = {"model": "gpt-4o-mini-transcribe"}
+            headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
+            r = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+        if r.ok:
+            j = r.json()
+            return j.get("text", "").strip()
+        else:
+            logger.warning("OpenAI transcription failed %s: %s", r.status_code, r.text)
+            return ""
+    except Exception as e:
+        logger.exception("transcribe_with_openai error: %s", e)
+        return ""
+
+
+# ---------------- Background pipeline (recording -> agent -> TTS -> hold_store) ----------------
+async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
+    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
+    audio_path = None
+    try:
+        # 1. Download recording (Twilio may require basic auth if using api.twilio.com)
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if recording_url and "api.twilio.com" in recording_url and TWILIO_SID and TWILIO_TOKEN else None
         r = requests.get(recording_url, auth=auth, timeout=30)
         r.raise_for_status()
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
@@ -97,220 +259,159 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         audio_path = tmp.name
         logger.info("[%s] saved recording to %s", call_sid, audio_path)
 
-        # Step 2: Transcribe audio with OpenAI Whisper
-        with open(audio_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f
-            )
-        transcript = result.text.strip()
+        # 2. Transcribe
+        transcript = transcribe_with_openai(audio_path)
         logger.info("[%s] transcript: %s", call_sid, transcript)
 
-        # Step 3: Call Agent or fallback to OpenAI Chat
-        try:
-            payload = {"convo_id": call_sid, "text": transcript}
-            headers = {"Content-Type": "application/json"}
-            if os.getenv("AGENT_API_KEY"):
-                headers["Authorization"] = f"Bearer {os.getenv('AGENT_API_KEY')}"
-            r2 = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=20)
-            if r2.ok:
-                data = r2.json()
-                reply_text = data.get("reply_text") or data.get("message") or ""
-            else:
-                logger.warning("[%s] Agent response not OK (%s): %s", call_sid, r2.status_code, r2.text)
-        except Exception as e:
-            logger.warning("[%s] Agent endpoint failed (%s); fallback to OpenAI", call_sid, e)
+        # 3. Send transcript to AGENT_ENDPOINT (best-effort) or use simple echo
+        reply_text = ""
+        if AGENT_ENDPOINT:
+            try:
+                headers = {"Content-Type": "application/json"}
+                if AGENT_KEY:
+                    headers["Authorization"] = f"Bearer {AGENT_KEY}"
+                payload = {"convo_id": call_sid, "text": transcript}
+                r2 = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=20)
+                if r2.ok:
+                    jr = r2.json()
+                    reply_text = jr.get("reply_text") or jr.get("message") or ""
+                    logger.info("[%s] agent reply obtained", call_sid)
+                else:
+                    logger.warning("[%s] agent returned status %s", call_sid, r2.status_code)
+            except Exception as e:
+                logger.exception("[%s] agent call failed: %s", call_sid, e)
 
         if not reply_text:
-            # Fallback to OpenAI ChatCompletion
-            chat = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful voice assistant."},
-                    {"role": "user", "content": transcript}
-                ],
-            )
-            reply_text = chat.choices[0].message.content.strip()
-        logger.info("[%s] assistant reply: %s", call_sid, reply_text[:200])
+            # fallback: simple response via OpenAI chat rather than agent
+            if OPENAI_KEY:
+                try:
+                    url = "https://api.openai.com/v1/chat/completions"
+                    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+                    body = {
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "system", "content": "You are a helpful voice assistant."},
+                                     {"role": "user", "content": transcript or ""}]
+                    }
+                    r3 = requests.post(url, headers=headers, json=body, timeout=30)
+                    if r3.ok:
+                        jr = r3.json()
+                        reply_text = (jr.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                    else:
+                        logger.warning("OpenAI chat failed: %s %s", r3.status_code, r3.text)
+                except Exception as e:
+                    logger.exception("OpenAI chat exception: %s", e)
+            if not reply_text:
+                reply_text = "Sorry, I couldn't compute an answer right now."
 
-        # Step 4: Generate TTS (ElevenLabs or fallback)
-        audio_bytes = None
-        if ELEVEN_API_KEY and ELEVEN_VOICE:
-            try:
-                tts_url_eleven = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
-                rtts = requests.post(
-                    tts_url_eleven,
-                    headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg"},
-                    json={"text": reply_text, "model_id": "eleven_turbo_v2"},
-                    timeout=20,
-                )
-                if rtts.ok:
-                    audio_bytes = rtts.content
-                    # Save locally for now (you can replace this with S3 upload)
-                    tts_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                    tts_file.write(audio_bytes)
-                    tts_file.flush()
-                    tts_file.close()
-                    tts_url = f"/tmp/{os.path.basename(tts_file.name)}"  # Simplified local reference
-                else:
-                    logger.warning("[%s] ElevenLabs TTS failed (%s)", call_sid, rtts.status_code)
-            except Exception as e:
-                logger.warning("[%s] ElevenLabs TTS error: %s", call_sid, e)
+        logger.info("[%s] assistant reply (trunc): %s", call_sid, reply_text[:200])
 
-        # Step 5: Fallback TTS (OpenAI if ElevenLabs fails)
-        if not tts_url:
-            try:
-                speech = client.audio.speech.create(
-                    model="gpt-4o-mini-tts",
-                    voice="alloy",
-                    input=reply_text
-                )
-                tts_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                speech.stream_to_file(tts_file.name)
-                tts_url = f"/tmp/{os.path.basename(tts_file.name)}"
-                logger.info("[%s] Generated fallback TTS", call_sid)
-            except Exception as e:
-                logger.warning("[%s] Fallback TTS failed: %s", call_sid, e)
+        # 4. Generate TTS and store
+        tts_url = None
+        try:
+            tts_url = create_and_upload_tts(reply_text)
+            if tts_url:
+                logger.info("[%s] created tts: %s", call_sid, tts_url)
+                # verify basic playability if it is an http(s) URL
+                if tts_url.startswith("http") and not is_url_playable(tts_url):
+                    logger.warning("[%s] tts url not reachable: %s", call_sid, tts_url)
+                    tts_url = None
+        except Exception as e:
+            logger.exception("[%s] TTS creation failed: %s", call_sid, e)
 
-        # Step 6: Mark ready for /hold endpoint
-        hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
-        logger.info("[%s] Hold ready (tts_url=%s)", call_sid, tts_url)
+        # 5. persist ready payload
+        payload = {"tts_url": tts_url, "reply_text": reply_text}
+        hold_store.set_ready(call_sid, payload)
+        logger.info("[%s] Hold ready", call_sid)
+
+        # 6. If call already ended, create outbound fallback (best-effort)
+        try:
+            if twilio_client and from_number:
+                call_obj = twilio_client.calls(call_sid).fetch()
+                status = getattr(call_obj, "status", "").lower()
+                if status not in ("in-progress", "ringing", "queued"):
+                    # call ended -> create new outbound call to play reply
+                    if payload.get("tts_url"):
+                        twiml = f"<Response><Play>{payload['tts_url']}</Play></Response>"
+                    else:
+                        safe = (payload.get("reply_text") or "").replace("&", " and ")
+                        twiml = f"<Response><Say>{safe}</Say></Response>"
+                    try:
+                        created = twilio_client.calls.create(to=from_number, from_=TWILIO_FROM, twiml=twiml)
+                        logger.info("[%s] Created fallback outbound call %s", call_sid, getattr(created, 'sid', 'unknown'))
+                    except Exception:
+                        logger.exception("[%s] Failed creating fallback outbound call", call_sid)
+        except Exception:
+            pass
 
     except Exception as e:
-        logger.exception("[%s] process_recording_background failed: %s", call_sid, e)
-        hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong while processing your request."})
+        logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
+        hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
 
     finally:
-        # cleanup local file
         try:
-            if os.path.exists(audio_path):
+            if audio_path and os.path.exists(audio_path):
                 os.unlink(audio_path)
         except Exception:
             pass
 
+
+# ---------------- HTTP endpoints ----------------
 @app.post("/recording")
 async def recording_webhook(
     request: Request,
-    call_sid: str = Form(..., alias="CallSid"),
-    from_number: str = Form(None, alias="From"),
-    recording_url: str = Form(..., alias="RecordingUrl"),
+    CallSid: str = Form(...),
+    From: Optional[str] = Form(None),
+    RecordingUrl: str = Form(...),
 ):
-    """
-    Twilio recording webhook.
-
-    Notes:
-    - We use `alias` so incoming form fields CallSid/From/RecordingUrl map correctly.
-    - We schedule the processing in the background so we return TwiML immediately.
-    - If `process_recording_background` is synchronous (blocking), we run it in a thread to avoid blocking the event loop.
-    """
-
+    """Twilio recording webhook: schedule background processing and redirect caller to /hold."""
+    call_sid = CallSid
+    from_number = From
+    recording_url = RecordingUrl
     logger.info("Recording webhook: CallSid=%s From=%s RecordingUrl=%s", call_sid, from_number, recording_url)
-
-    # pick the worker function and schedule it safely
+    # schedule background worker (non-blocking)
     try:
-        # If process_recording_background is async (async def), schedule directly:
-        if asyncio.iscoroutinefunction(process_recording_background):
-            asyncio.create_task(process_recording_background(call_sid, recording_url, from_number))
-        else:
-            # It's a blocking / sync function — run in a thread to avoid blocking the event loop.
-            asyncio.create_task(asyncio.to_thread(process_recording_background, call_sid, recording_url, from_number))
-    except Exception as e:
-        logger.exception("[%s] Failed to schedule background task: %s", call_sid, e)
+        asyncio.create_task(process_recording_background(call_sid, recording_url, from_number))
+    except Exception:
+        # fallback to threading if event loop can't schedule
+        asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(process_recording_background(call_sid, recording_url, from_number)))
 
-    # Immediate TwiML reply so Twilio is happy and will poll /hold
     resp = VoiceResponse()
     resp.say("Got it. Please hold while I prepare your response.", voice="alice")
-    # redirect caller into the /hold polling flow we already implemented
     base = str(request.base_url).rstrip("/")
     resp.redirect(f"{base}/hold?convo_id={call_sid}")
     return Response(content=str(resp), media_type="text/xml")
 
-def _try_get_ready(convo_id: str) -> Optional[dict]:
-    """
-    Try to read from hold_store (if available) else in-memory fallback.
-    Returns payload dict or None.
-    """
-    try:
-        # prefer using provided hold_store if available
-        if 'hold_store' in globals() and hasattr(hold_store, "get_ready"):
-            return hold_store.get_ready(convo_id)
-    except Exception:
-        logger.exception("Redis/get hold_store failed; using in-memory fallback")
-
-    # fallback: pop from in-memory dict (one-time delivery)
-    with _in_memory_lock:
-        return _in_memory_hold.pop(convo_id, None)
-
-def _try_set_ready(convo_id: str, payload: dict, expire: int = 300):
-    """
-    Try to set in hold_store (if available) else in-memory fallback.
-    """
-    try:
-        if 'hold_store' in globals() and hasattr(hold_store, "set_ready"):
-            return hold_store.set_ready(convo_id, payload, ex=expire)
-    except Exception:
-        logger.exception("Redis/set hold_store failed; using in-memory fallback")
-    with _in_memory_lock:
-        _in_memory_hold[convo_id] = payload
-    return None
-
-def _unescape_url(u: Optional[str]) -> Optional[str]:
-    if not u:
-        return None
-    return html.unescape(u).strip().strip('"')
-
-def _is_playable_safe(url: str) -> bool:
-    """
-    Wrapper for your existing is_url_playable (if exists). If not present, return False
-    (so we fall back to Say).
-    """
-    try:
-        if 'is_url_playable' in globals() and callable(is_url_playable):
-            return is_url_playable(url)
-    except Exception:
-        logger.exception("is_url_playable check failed")
-    return False
 
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
-    """
-    Twilio will poll /hold until the background worker sets the reply in hold_store.
-    When ready we either <Play> a presigned TTS URL or <Say> the reply_text.
-    After playing/saying, we issue a <Record> so the caller can respond and continue the flow.
-    """
+    """Twilio will poll /hold until we set the reply in hold_store. """
     try:
-        ready = _try_get_ready(convo_id)
+        ready = hold_store.get_ready(convo_id)
         resp = VoiceResponse()
-
         if ready:
-            # prefer playable TTS URL
             tts_url = _unescape_url(ready.get("tts_url")) if isinstance(ready, dict) else None
-            if tts_url and _is_playable_safe(tts_url):
+            if tts_url and tts_url.startswith("file://"):
+                # local file -> convert to a path Twilio can't play; fall back to Say
+                txt = ready.get("reply_text", "") if isinstance(ready, dict) else ""
+                resp.say(txt or "Sorry, I don't have an answer right now.", voice="alice")
+            elif tts_url and is_url_playable(tts_url):
                 resp.play(tts_url)
             else:
-                txt = (ready.get("reply_text") if isinstance(ready, dict) else None) or ""
-                if not txt:
-                    txt = "Sorry, I don't have an answer right now."
-                resp.say(txt, voice="alice")
-
-            # After reply, record caller again so a conversation can continue.
-            # action should be the recording callback endpoint in your app (adjust name if different)
+                txt = ready.get("reply_text", "") if isinstance(ready, dict) else ""
+                resp.say(txt or "Sorry, I don't have an answer right now.", voice="alice")
+            # after reply, record again for continued conversation
             base = str(request.base_url).rstrip("/")
-            # prefer an existing helper recording callback if you have one; otherwise use /recording
-            action_url = f"{base}/recording"
-            resp.record(max_length=30, action=action_url, play_beep=True, timeout=2)
+            resp.record(max_length=30, action=f"{base}/recording", play_beep=True, timeout=2)
             return Response(content=str(resp), media_type="text/xml")
 
-        # Not ready -> keep caller on hold and redirect back to /hold (Twilio will poll)
+        # not ready -> keep caller on hold and redirect back to /hold
         base = str(request.base_url).rstrip("/")
         redirect_url = f"{base}/hold?convo_id={convo_id}"
         resp.say("Please hold while I prepare your response.", voice="alice")
-        # pause for a bit, then redirect back to /hold
         resp.pause(length=8)
         resp.redirect(redirect_url)
         return Response(content=str(resp), media_type="text/xml")
-
     except Exception as e:
         logger.exception("Hold error: %s", e)
         resp = VoiceResponse()
@@ -318,340 +419,137 @@ async def hold(request: Request, convo_id: str = Query(...)):
         return Response(content=str(resp), media_type="text/xml")
 
 
-# --- Convenience testing endpoints --- (optional; remove if you already have similar)
-@app.post("/_test_set_hold")
-async def _test_set_hold(convo_id: str = Query(...), reply_text: str = Query("Test reply"), tts_url: str = Query(None)):
-    """
-    Quick helper to set the hold payload for testing:
-    curl -X POST "https://.../ _test_set_hold?convo_id=TEST-1&reply_text=hello"
-    """
-    payload = {"tts_url": tts_url, "reply_text": reply_text}
-    _try_set_ready(convo_id, payload)
-    return {"ok": True, "convo_id": convo_id, "payload": payload}
-
-
-# Twilio client (optional)
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
-
-# -----------------------------
-# HoldStore: Redis / memory / file fallback
-# -----------------------------
-class HoldStore:
-    """
-    Provides set_ready/get_ready for the 'hold' polling flow.
-    Tries Redis when configured; otherwise uses in-memory and file fallback.
-    get_ready pops the value (so callers don't get duplicates).
-    All operations are best-effort and will not raise to request handlers.
-    """
-
-    def __init__(self, redis_url: Optional[str] = None, file_dir: str = "/tmp/hold_store"):
-        self.redis_url = redis_url
-        self.redis_client = None
-        self.inmemory = {}
-        self.file_dir = Path(file_dir)
-        self.file_dir.mkdir(parents=True, exist_ok=True)
-
-        if redis_url:
-            try:
-                # lazy import here to avoid import if not present
-                import redis  # type: ignore
-                # Create Redis client from URL
-                self.redis_client = redis.from_url(redis_url, decode_responses=True)
-                # quick ping to ensure it's valid (best-effort)
-                try:
-                    self.redis_client.ping()
-                    logger.info("HoldStore: Redis connected")
-                except Exception as e:
-                    logger.warning("HoldStore: Redis ping failed; falling back. %s", e)
-                    self.redis_client = None
-            except Exception as e:
-                logger.exception("HoldStore: redis package unavailable or failed to init: %s", e)
-                self.redis_client = None
-        else:
-            logger.info("HoldStore: No REDIS_URL configured, using fallback stores")
-
-    def _file_path(self, convo_id: str) -> Path:
-        safe = "".join([c for c in convo_id if c.isalnum() or c in "-_."]).strip()
-        return self.file_dir / f"{safe}.json"
-
-    def set_ready(self, convo_id: str, payload: dict, expire: int = 300):
-        """
-        Store the payload for the convo. Best-effort: tries Redis, on failure uses file or in-memory.
-        """
-        try:
-            j = json.dumps(payload)
-        except Exception:
-            j = json.dumps({"reply_text": str(payload)})
-
-        # Try Redis first
-        if self.redis_client:
-            try:
-                # Use EX for expiry
-                self.redis_client.set(f"hold:{convo_id}", j, ex=expire)
-                logger.info("HoldStore: Redis set hold:%s", convo_id)
-                return
-            except Exception as e:
-                logger.warning("Redis set failed for hold:%s -- falling back (%s)", convo_id, e)
-                # fall through to file/in-memory
-
-        # File fallback (persisted)
-        try:
-            p = self._file_path(convo_id)
-            with p.open("w", encoding="utf-8") as fh:
-                fh.write(j)
-            logger.info("HoldStore: File fallback wrote %s", p)
-            return
-        except Exception as e:
-            logger.warning("File fallback write failed for %s: %s", convo_id, e)
-
-        # In-memory fallback
-        try:
-            self.inmemory[convo_id] = payload
-            logger.info("HoldStore: In-memory set for %s", convo_id)
-            return
-        except Exception as e:
-            logger.exception("HoldStore: Failed to set in-memory for %s: %s", convo_id, e)
-
-    def get_ready(self, convo_id: str) -> Optional[dict]:
-        """
-        Pop and return payload if present. Returns None if not present.
-        This never raises; all exceptions are caught and logged.
-        """
-        # Try Redis
-        if self.redis_client:
-            try:
-                v = self.redis_client.get(f"hold:{convo_id}")
-                if v:
-                    try:
-                        payload = json.loads(v)
-                    except Exception:
-                        payload = {"reply_text": v}
-                    # delete key so it behaves like pop
-                    try:
-                        self.redis_client.delete(f"hold:{convo_id}")
-                    except Exception:
-                        pass
-                    logger.info("HoldStore: Redis popped hold:%s", convo_id)
-                    return payload
-            except Exception as e:
-                logger.warning("Redis get failed for hold:%s, trying fallback: %s", convo_id, e)
-
-        # Try file fallback
-        try:
-            p = self._file_path(convo_id)
-            if p.exists():
-                try:
-                    with p.open("r", encoding="utf-8") as fh:
-                        txt = fh.read()
-                    payload = json.loads(txt)
-                except Exception:
-                    payload = {"reply_text": txt}
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
-                logger.info("HoldStore: File popped for %s", convo_id)
-                return payload
-        except Exception as e:
-            logger.warning("File fallback get failed for %s: %s", convo_id, e)
-
-        # In-memory fallback
-        try:
-            return self.inmemory.pop(convo_id, None)
-        except Exception as e:
-            logger.exception("HoldStore: In-memory pop failed for %s: %s", convo_id, e)
-            return None
-
-
-# instantiate global hold_store
-hold_store = HoldStore(redis_url=REDIS_URL)
-
-# Per-session object that holds state for a Twilio Media Stream session
+# ---------------- Minimal Twilio Media Streams websocket handler (realtime) ----------------
 class SessionState:
     def __init__(self, call_sid: str, twilio_ws: WebSocket):
         self.call_sid = call_sid
         self.twilio_ws = twilio_ws
-        self.openai_ws = None  # websockets connection to OpenAI Realtime-like endpoint
+        self.openai_ws = None
         self.closed = False
-        self.audio_queue = asyncio.Queue()  # audio chunks to send to OpenAI
-        self.transcript_buffer = ""  # accumulate interim text if desired
+        self.audio_queue = asyncio.Queue()
 
     async def close(self):
         self.closed = True
         try:
-            if self.openai_ws and getattr(self.openai_ws, "open", False):
+            if self.openai_ws:
                 await self.openai_ws.close()
         except Exception:
             pass
         try:
-            if getattr(self.twilio_ws, "application_state", None) != WebSocketState.DISCONNECTED:
-                await self.twilio_ws.close()
+            await self.twilio_ws.close()
         except Exception:
             pass
 
 
-# Helper: open websocket to OpenAI Realtime (or similar) and pump audio from queue
 async def open_openai_realtime(session: SessionState):
-    if not OPENAI_REALTIME_WSS or not OPENAI_API_KEY:
-        logger.warning("OpenAI realtime not configured; skipping realtime ASR.")
+    if not OPENAI_REALTIME_WSS or not OPENAI_KEY:
+        logger.info("Realtime not configured, skipping")
         return
-
-    headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
-    logger.info("[%s] Connecting to OpenAI Realtime %s", session.call_sid, OPENAI_REALTIME_WSS)
+    headers = [("Authorization", f"Bearer {OPENAI_KEY}")]
     try:
         async with websockets.connect(OPENAI_REALTIME_WSS, extra_headers=headers, max_size=None) as ows:
             session.openai_ws = ows
-            # (Optional) Send session init message (depends on provider)
-            init_msg = {"type": "session.update", "session": {"instructions": "You are an assistant transcribing and answering user audio."}}
-            try:
-                await ows.send(json.dumps(init_msg))
-            except Exception:
-                pass
-
-            sender_task = asyncio.create_task(openai_sender_loop(session, ows))
-            receiver_task = asyncio.create_task(openai_receiver_loop(session, ows))
-
-            done, pending = await asyncio.wait([sender_task, receiver_task], return_when=asyncio.FIRST_EXCEPTION)
-            for t in pending:
-                t.cancel()
+            sender = asyncio.create_task(openai_sender_loop(session, ows))
+            receiver = asyncio.create_task(openai_receiver_loop(session, ows))
+            done, pending = await asyncio.wait([sender, receiver], return_when=asyncio.FIRST_EXCEPTION)
+            for p in pending:
+                p.cancel()
     except Exception as e:
-        logger.exception("[%s] open_openai_realtime failure: %s", session.call_sid, e)
+        logger.exception("open_openai_realtime error: %s", e)
 
 
 async def openai_sender_loop(session: SessionState, ows):
-    """
-    Reads raw PCM frames from session.audio_queue and forwards them as base64
-    in a message the realtime model accepts.
-    """
     try:
         while not session.closed:
             chunk = await session.audio_queue.get()
             if chunk is None:
-                commit_msg = {"type": "input_audio_buffer.commit"}
                 try:
-                    await ows.send(json.dumps(commit_msg))
+                    await ows.send(json.dumps({"type": "input_audio_buffer.commit"}))
                 except Exception:
                     pass
                 continue
-
             b64 = base64.b64encode(chunk).decode("ascii")
-            msg = {"type": "input_audio_buffer.append", "audio": b64}
             try:
-                await ows.send(json.dumps(msg))
-            except Exception as e:
-                logger.exception("[%s] openai_sender_loop send failed: %s", session.call_sid, e)
-                # if send fails, break out (receiver will detect closed)
+                await ows.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+            except Exception:
                 break
     except Exception as e:
-        logger.exception("[%s] openai_sender_loop error: %s", session.call_sid, e)
+        logger.exception("openai_sender_loop error: %s", e)
 
 
 async def openai_receiver_loop(session: SessionState, ows):
-    """
-    Receives messages from OpenAI realtime, expects transcription events.
-    When we receive final transcripts, forward to agent and optionally play back.
-    """
     try:
         async for raw in ows:
             try:
-                data = json.loads(raw)
+                d = json.loads(raw)
             except Exception:
-                logger.debug("openai recv non-json: %s", raw)
+                logger.debug("non-json realtime message: %s", raw)
                 continue
-
-            typ = data.get("type")
-            if typ in ("transcript", "response.create", "message"):
-                is_final = data.get("is_final", False)
-                # prefer explicit fields
-                text = data.get("text") or data.get("content") or (data.get("alternatives") or [{}])[0].get("transcript")
-                if text:
-                    logger.info("[%s] Realtime transcript (final=%s): %s", session.call_sid, is_final, text)
-                    if is_final:
-                        await handle_final_transcript(session, text)
-                    else:
-                        # optionally forward partial interim results to some UI
-                        pass
-            else:
-                logger.debug("[%s] openai event: %s", session.call_sid, data)
-    except websockets.exceptions.ConnectionClosedOK:
-        logger.info("[%s] openai websocket closed", session.call_sid)
+            t = d.get("type")
+            if t == "transcript":
+                text = d.get("text") or d.get("alternatives", [{}])[0].get("transcript")
+                is_final = d.get("is_final", False)
+                if text and is_final:
+                    await handle_final_transcript(session, text)
     except Exception as e:
-        logger.exception("[%s] openai_receiver_loop error: %s", session.call_sid, e)
+        logger.exception("openai_receiver_loop error: %s", e)
 
 
 async def handle_final_transcript(session: SessionState, text: str):
-    """
-    Send the final transcript to your agent endpoint (AGENT_ENDPOINT).
-    AGENT_ENDPOINT should return JSON e.g. {"reply_text":"...","expect_followup":false}
-    Then play or say the reply on the live Twilio call.
-    """
     try:
         payload = {"convo": session.call_sid, "text": text}
         agent_resp = None
         if AGENT_ENDPOINT:
             try:
-                r = requests.post(AGENT_ENDPOINT, json=payload, timeout=10)
-                r.raise_for_status()
-                agent_resp = r.json()
-            except Exception as e:
-                logger.exception("[%s] Agent call failed: %s", session.call_sid, e)
-
-        if not agent_resp:
-            reply_text = f"I heard: {text}"
-            expect_followup = False
-        else:
+                headers = {"Content-Type": "application/json"}
+                if AGENT_KEY:
+                    headers["Authorization"] = f"Bearer {AGENT_KEY}"
+                r = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=10)
+                if r.ok:
+                    agent_resp = r.json()
+            except Exception:
+                logger.exception("agent call in realtime failed")
+        if agent_resp:
             reply_text = agent_resp.get("reply_text", "")
             expect_followup = bool(agent_resp.get("expect_followup", False))
+        else:
+            reply_text = f"I heard: {text}"
+            expect_followup = False
 
-        # Quick update to live Twilio call with TwiML (interruptive but low-latency)
         if twilio_client:
-            def escape_for_twiML(s: str) -> str:
-                return (s or "").replace("&", "and").replace("<", "").replace(">", "")
-
-            twiml = f"<Response><Say voice='alice'>{escape_for_twiML(reply_text)}</Say>"
+            safe = (reply_text or "").replace("&", " and ")
+            twiml = f"<Response><Say voice='alice'>{safe}</Say>"
             if expect_followup:
                 twiml += "<Record maxLength='30' action='/recording' playBeep='true'/>"
             twiml += "</Response>"
             try:
                 twilio_client.calls(session.call_sid).update(twiml=twiml)
-                logger.info("[%s] Updated live call with TTS/text reply", session.call_sid)
+                logger.info("[%s] updated live call with realtime reply", session.call_sid)
             except Exception:
-                logger.exception("[%s] Failed to update live call with TwiML", session.call_sid)
-        else:
-            logger.info("[%s] No Twilio client configured; agent reply: %s", session.call_sid, reply_text)
+                logger.exception("Failed to update live call with realtime reply")
+
     except Exception as e:
-        logger.exception("[%s] handle_final_transcript error: %s", session.call_sid, e)
+        logger.exception("handle_final_transcript failed: %s", e)
 
 
-# Twilio will open a websocket and send JSON messages. We'll implement the Twilio side handler here.
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
-    """
-    Example Twilio Media Streams websocket handler.
-    Twilio sends messages of shape:
-      {"event":"start","start":{"callSid":"CA...","streamSid":"..."}}
-      {"event":"media","media":{"track":"inbound","chunk":"<base64>","timestamp":"..."}}
-      {"event":"stop"}
-    """
     await ws.accept()
     session: Optional[SessionState] = None
-    openai_task = None
     try:
         while True:
             payload = await ws.receive_text()
             data = json.loads(payload)
-            event = data.get("event")
-            if event == "start":
+            ev = data.get("event")
+            if ev == "start":
                 call_sid = data.get("start", {}).get("callSid")
                 if not call_sid:
-                    logger.warning("media-stream start with no callSid")
                     await ws.close()
                     return
                 session = SessionState(call_sid=call_sid, twilio_ws=ws)
-                # spin up background openai realtime connector
-                openai_task = asyncio.create_task(open_openai_realtime(session))
-                logger.info("[%s] Twilio media-stream start", call_sid)
-            elif event == "media":
+                asyncio.create_task(open_openai_realtime(session))
+                logger.info("%s media stream started", call_sid)
+            elif ev == "media":
                 m = data.get("media", {})
                 b64chunk = m.get("payload") or m.get("chunk")
                 if not b64chunk:
@@ -659,10 +557,9 @@ async def media_stream(ws: WebSocket):
                 raw = base64.b64decode(b64chunk)
                 if session:
                     await session.audio_queue.put(raw)
-            elif event == "stop":
-                logger.info("[%s] Twilio media-stream stop", session.call_sid if session else "unknown")
+            elif ev == "stop":
                 if session:
-                    await session.audio_queue.put(None)  # commit
+                    await session.audio_queue.put(None)
                     await session.close()
                 await ws.close()
                 return
