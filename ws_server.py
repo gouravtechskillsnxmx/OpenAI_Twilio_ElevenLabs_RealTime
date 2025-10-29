@@ -1,7 +1,5 @@
-# ws_server.py (updated)
-# Minimal, deployable version with: /recording webhook, /hold polling flow,
-# background processing, robust HoldStore (redis/file/memory fallback),
-# and a minimal Twilio Media Streams -> OpenAI realtime skeleton.
+# ws_server.py (updated with safer ElevenLabs TTS + upload)
+# Based on the file you provided previously. See file reference. :contentReference[oaicite:1]{index=1}
 
 import os
 import asyncio
@@ -30,6 +28,15 @@ except Exception:
     openai = None
     OPENAI_PY_SDK = False
 
+# Optional boto3 for S3 uploads
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+    BOTO3_AVAILABLE = True
+except Exception:
+    boto3 = None
+    BOTO3_AVAILABLE = False
+
 # --------- Configuration (from env) ----------
 OPENAI_REALTIME_WSS = os.environ.get("OPENAI_REALTIME_WSS")
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -41,6 +48,10 @@ AGENT_KEY = os.environ.get("AGENT_KEY")
 ELEVEN_API_KEY = os.environ.get("ELEVEN_API_KEY")
 ELEVEN_VOICE = os.environ.get("ELEVEN_VOICE")
 REDIS_URL = os.environ.get("REDIS_URL")
+
+# Optional S3 configuration for TTS upload (presigned URL)
+S3_BUCKET = os.environ.get("S3_BUCKET")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ws_server")
@@ -175,20 +186,92 @@ def is_url_playable(url: str, timeout: int = 5) -> bool:
     except Exception:
         return False
 
+def create_tts_elevenlabs(text: str, voice_id: str = ELEVEN_VOICE, api_key: str = ELEVEN_API_KEY, timeout: int = 30) -> Optional[bytes]:
+    """
+    Generate speech using ElevenLabs TTS.
+    Returns raw audio bytes (mp3). Logs and returns None on failure.
+    """
+    if not api_key or not voice_id:
+        logger.error("No ElevenLabs API key or voice configured.")
+        return None
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            logger.error("ElevenLabs error %s: %s", r.status_code, r.text[:300])
+            return None
+
+        ctype = r.headers.get("content-type", "")
+        if not ctype.startswith("audio/"):
+            logger.error("Unexpected ElevenLabs response type: %s\nBody: %s", ctype, r.text[:300])
+            return None
+
+        return r.content
+
+    except Exception as e:
+        logger.exception("TTS request failed: %s", e)
+        return None
+
+
+def upload_bytes_to_s3(data: bytes, filename: str) -> Optional[str]:
+    """
+    Upload bytes to S3 and return a presigned URL if possible.
+    If S3 isn't configured, fallback to writing a temp file and return file:// path.
+    """
+    if not data:
+        return None
+
+    # Try S3 if configured and boto3 available
+    if S3_BUCKET and BOTO3_AVAILABLE:
+        try:
+            session_kwargs = {}
+            # boto3 uses env creds by default; no need to pass explicitly
+            s3 = boto3.client("s3", region_name=AWS_REGION)
+            key = f"tts/{filename}"
+            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType="audio/mpeg")
+            # create presigned url (valid 15 minutes)
+            url = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=900,
+            )
+            logger.info("upload_bytes_to_s3: uploaded to s3://%s/%s", S3_BUCKET, key)
+            return url
+        except (BotoCoreError, ClientError) as e:
+            logger.exception("upload_bytes_to_s3 S3 upload failed: %s", e)
+        except Exception:
+            logger.exception("upload_bytes_to_s3 unexpected error")
+
+    # Fallback: local temp file
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(data)
+        tmp.flush()
+        tmp.close()
+        path = tmp.name
+        logger.info("upload_bytes_to_s3: wrote local temp file %s", path)
+        return f"file://{path}"
+    except Exception:
+        logger.exception("upload_bytes_to_s3 fallback write failed")
+        return None
+
 
 def create_and_upload_tts(text: str) -> Optional[str]:
-    """Create TTS audio; returns a URL or local path. Minimal: prefer ElevenLabs if configured.
-    This implementation writes a local temp file and returns a file:// path (sufficient for testing).
-    Replace with S3 upload if you want presigned URLs.
-    """
+    """(Legacy helper) Try ElevenLabs -> write tmp file. Kept for compatibility."""
     if not text:
         return None
-    # Try ElevenLabs
     if ELEVEN_API_KEY and ELEVEN_VOICE:
         try:
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
             resp = requests.post(
-                url,
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}",
                 headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg"},
                 json={"text": text},
                 timeout=20,
@@ -204,14 +287,10 @@ def create_and_upload_tts(text: str) -> Optional[str]:
         except Exception as e:
             logger.exception("ElevenLabs TTS exception: %s", e)
 
-    # Fallback: if OpenAI SDK available, try TTS or else return None
     if OPENAI_PY_SDK and openai and OPENAI_KEY:
         try:
-            # The exact API depends on SDK and model; here we attempt a naive approach
-            # NOTE: Many deployments will want to use OpenAI's TTS endpoints differently.
             out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             out.close()
-            # Do nothing complex here; return path for callers to use
             return f"file://{out.name}"
         except Exception:
             logger.exception("Fallback OpenAI TTS failed")
@@ -219,9 +298,7 @@ def create_and_upload_tts(text: str) -> Optional[str]:
 
 
 def transcribe_with_openai(file_path: str) -> str:
-    """Transcribe using OpenAI's transcription endpoint via HTTP. Uses OPENAI_KEY env var.
-    Returns text or empty string.
-    """
+    """Transcribe using OpenAI's transcription endpoint via HTTP. Uses OPENAI_KEY env var."""
     if not OPENAI_KEY:
         logger.warning("OPENAI_KEY not set; cannot transcribe")
         return ""
@@ -263,7 +340,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         transcript = transcribe_with_openai(audio_path)
         logger.info("[%s] transcript: %s", call_sid, transcript)
 
-        # 3. Send transcript to AGENT_ENDPOINT (best-effort) or use simple echo
+        # 3. Send transcript to AGENT_ENDPOINT (best-effort) or use simple echo/OpenAI
         reply_text = ""
         if AGENT_ENDPOINT:
             try:
@@ -305,18 +382,29 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 
         logger.info("[%s] assistant reply (trunc): %s", call_sid, reply_text[:200])
 
-        # 4. Generate TTS and store
+        # === NEW: Safer ElevenLabs TTS generation and upload ===
         tts_url = None
         try:
-            tts_url = create_and_upload_tts(reply_text)
-            if tts_url:
-                logger.info("[%s] created tts: %s", call_sid, tts_url)
-                # verify basic playability if it is an http(s) URL
-                if tts_url.startswith("http") and not is_url_playable(tts_url):
-                    logger.warning("[%s] tts url not reachable: %s", call_sid, tts_url)
+            audio_bytes = create_tts_elevenlabs(reply_text)
+            if not audio_bytes:
+                logger.warning("[%s] ElevenLabs TTS failed, falling back to text", call_sid)
+                tts_url = None
+            else:
+                uploaded = upload_bytes_to_s3(audio_bytes, filename=f"{call_sid}.mp3")
+                if uploaded:
+                    tts_url = uploaded
+                    logger.info("[%s] TTS uploaded to: %s", call_sid, tts_url)
+                    # verify if it's a reachable HTTP(S) URL
+                    if tts_url.startswith("http") and not is_url_playable(tts_url):
+                        logger.warning("[%s] Uploaded TTS URL not reachable: %s", call_sid, tts_url)
+                        tts_url = None
+                else:
+                    logger.warning("[%s] Upload returned no URL; falling back to text", call_sid)
                     tts_url = None
         except Exception as e:
-            logger.exception("[%s] TTS creation failed: %s", call_sid, e)
+            logger.exception("[%s] TTS pipeline error: %s", call_sid, e)
+            tts_url = None
+        # === END NEW ===
 
         # 5. persist ready payload
         payload = {"tts_url": tts_url, "reply_text": reply_text}
@@ -392,7 +480,7 @@ async def hold(request: Request, convo_id: str = Query(...)):
         if ready:
             tts_url = _unescape_url(ready.get("tts_url")) if isinstance(ready, dict) else None
             if tts_url and tts_url.startswith("file://"):
-                # local file -> convert to a path Twilio can't play; fall back to Say
+                # local file -> Twilio can't use file:// in production; fall back to Say
                 txt = ready.get("reply_text", "") if isinstance(ready, dict) else ""
                 resp.say(txt or "Sorry, I don't have an answer right now.", voice="alice")
             elif tts_url and is_url_playable(tts_url):
