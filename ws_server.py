@@ -1,5 +1,5 @@
 # ws_server.py (updated with safer ElevenLabs TTS + upload)
-# Based on the file you provided previously. See file reference. :contentReference[oaicite:1]{index=1}
+# Based on the file you provided previously. See file reference.
 
 import os
 import asyncio
@@ -206,7 +206,21 @@ def create_tts_elevenlabs(text: str, voice_id: str = ELEVEN_VOICE, api_key: str 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200:
-            logger.error("ElevenLabs error %s: %s", r.status_code, r.text[:300])
+            # Try to parse JSON error if present for clearer logs (e.g. missing_permissions)
+            body = r.text or ""
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            logger.error("ElevenLabs error %s: %s", r.status_code, body[:1000])
+            if isinstance(j, dict):
+                # log structured detail if present
+                detail = j.get("detail") or j.get("error") or j.get("message")
+                if detail:
+                    logger.error("ElevenLabs detail: %s", detail)
+                    # helpful explicit message when missing permissions
+                    if isinstance(detail, dict) and detail.get("status") == "missing_permissions":
+                        logger.error("ElevenLabs API key missing permissions: %s", detail.get("message"))
             return None
 
         ctype = r.headers.get("content-type", "")
