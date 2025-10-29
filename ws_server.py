@@ -597,6 +597,26 @@ async def openai_receiver_loop(session: SessionState, ows):
         logger.exception("openai_receiver_loop error: %s", e)
 
 
+# === DEBUG / TEST ENDPOINTS ===
+from fastapi import Query
+
+@app.post("/_test_set_hold")
+def test_set_hold(convo_id: str = Query(...), reply_text: str = Query("Hello from test")):
+    """
+    Manually inject a ready payload into hold_store for testing.
+    Usage:
+      POST /_test_set_hold?convo_id=TEST12345&reply_text=Hello+from+test
+    """
+    payload = {"tts_url": None, "reply_text": reply_text}
+    try:
+        hold_store.set_ready(convo_id, payload)
+        return {"ok": True, "convo_id": convo_id, "payload": payload}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
+
+
 async def handle_final_transcript(session: SessionState, text: str):
     try:
         payload = {"convo": session.call_sid, "text": text}
