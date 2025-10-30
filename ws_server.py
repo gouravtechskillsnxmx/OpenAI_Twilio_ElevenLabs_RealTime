@@ -337,125 +337,121 @@ def transcribe_with_openai(file_path: str) -> str:
 # ---------------- Background pipeline (recording -> agent -> TTS -> hold_store) ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
-    audio_path = None
     try:
-        # 1. Download recording (Twilio may require basic auth if using api.twilio.com)
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if recording_url and "api.twilio.com" in recording_url and TWILIO_SID and TWILIO_TOKEN else None
-        r = requests.get(recording_url, auth=auth, timeout=30)
-        r.raise_for_status()
+        url = build_download_url(recording_url)
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and "api.twilio.com" in url else None
+        try:
+            r = requests.get(url, auth=auth, timeout=30)
+            r.raise_for_status()
+        except Exception as e:
+            logger.exception("[%s] Failed to download recording: %s", call_sid, e)
+            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            return
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(r.content)
         tmp.flush()
         tmp.close()
-        audio_path = tmp.name
-        logger.info("[%s] saved recording to %s", call_sid, audio_path)
+        file_path = tmp.name
+        logger.info("[%s] saved recording to %s", call_sid, file_path)
 
-        # 2. Transcribe
-        transcript = transcribe_with_openai(audio_path)
-        logger.info("[%s] transcript: %s", call_sid, transcript)
+        transcript = ""
+        try:
+            transcript = transcribe_with_openai(file_path)
+            logger.info("[%s] transcript: %s", call_sid, transcript)
+        except Exception as e:
+            logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
+            transcript = ""
 
-        # 3. Send transcript to AGENT_ENDPOINT (best-effort) or use simple echo/OpenAI
-        reply_text = ""
-        if AGENT_ENDPOINT:
-            try:
-                headers = {"Content-Type": "application/json"}
-                if AGENT_KEY:
-                    headers["Authorization"] = f"Bearer {AGENT_KEY}"
-                payload = {"convo_id": call_sid, "text": transcript}
-                r2 = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=20)
-                if r2.ok:
-                    jr = r2.json()
-                    reply_text = jr.get("reply_text") or jr.get("message") or ""
-                    logger.info("[%s] agent reply obtained", call_sid)
-                else:
-                    logger.warning("[%s] agent returned status %s", call_sid, r2.status_code)
-            except Exception as e:
-                logger.exception("[%s] agent call failed: %s", call_sid, e)
+        # cleanup audio file
+        try:
+            os.unlink(file_path)
+        except Exception:
+            pass
 
-        if not reply_text:
-            # fallback: simple response via OpenAI chat rather than agent
-            if OPENAI_KEY:
+        # Agent call - expects structured dict
+        try:
+            agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
+            reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
+            memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
+        except Exception as e:
+            logger.exception("[%s] agent call failed: %s", call_sid, e)
+            reply_text = "Sorry, I'm having trouble right now."
+            memory_writes = []
+
+        logger.info("[%s] assistant reply (truncated): %s",
+                    call_sid,
+                    (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
+
+        # If agent returned memory writes, persist them (best-effort)
+        if memory_writes and isinstance(memory_writes, list):
+            for mw in memory_writes:
                 try:
-                    url = "https://api.openai.com/v1/chat/completions"
-                    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
-                    body = {
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role": "system", "content": "You are a helpful voice assistant."},
-                                     {"role": "user", "content": transcript or ""}]
-                    }
-                    r3 = requests.post(url, headers=headers, json=body, timeout=30)
-                    if r3.ok:
-                        jr = r3.json()
-                        reply_text = (jr.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-                    else:
-                        logger.warning("OpenAI chat failed: %s %s", r3.status_code, r3.text)
-                except Exception as e:
-                    logger.exception("OpenAI chat exception: %s", e)
-            if not reply_text:
-                reply_text = "Sorry, I couldn't compute an answer right now."
-
-        logger.info("[%s] assistant reply (trunc): %s", call_sid, reply_text[:200])
+                    if callable(write_fact):
+                        write_fact(mw)
+                except Exception:
+                    logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
 
         # === NEW: Safer ElevenLabs TTS generation and upload ===
         tts_url = None
         try:
+            # create_tts_elevenlabs returns raw audio bytes or None on failure
             audio_bytes = create_tts_elevenlabs(reply_text)
             if not audio_bytes:
-                logger.warning("[%s] ElevenLabs TTS failed, falling back to text", call_sid)
+                logger.warning("[%s] ElevenLabs TTS returned no audio bytes, falling back to text", call_sid)
                 tts_url = None
             else:
-                uploaded = upload_bytes_to_s3(audio_bytes, filename=f"{call_sid}.mp3")
-                if uploaded:
-                    tts_url = uploaded
-                    logger.info("[%s] TTS uploaded to: %s", call_sid, tts_url)
-                    # verify if it's a reachable HTTP(S) URL
-                    if tts_url.startswith("http") and not is_url_playable(tts_url):
-                        logger.warning("[%s] Uploaded TTS URL not reachable: %s", call_sid, tts_url)
-                        tts_url = None
-                else:
-                    logger.warning("[%s] Upload returned no URL; falling back to text", call_sid)
+                try:
+                    tts_url = upload_bytes_to_s3(audio_bytes, filename=f"{call_sid}.mp3")
+                    logger.info("[%s] TTS uploaded to S3: %s", call_sid, tts_url)
+                except Exception as e:
+                    logger.exception("[%s] Failed to upload TTS to S3: %s", call_sid, e)
                     tts_url = None
+        except requests.HTTPError as he:
+            # requests errors from create_tts_elevenlabs (if it uses requests internally)
+            try:
+                content = he.response.text if getattr(he, "response", None) is not None else None
+            except Exception:
+                content = None
+            logger.error("[%s] ElevenLabs HTTP error: %s; body: %s", call_sid, str(he), content)
+            tts_url = None
         except Exception as e:
             logger.exception("[%s] TTS pipeline error: %s", call_sid, e)
             tts_url = None
         # === END NEW ===
 
-        # 5. persist ready payload
-        payload = {"tts_url": tts_url, "reply_text": reply_text}
-        hold_store.set_ready(call_sid, payload)
-        logger.info("[%s] Hold ready", call_sid)
+        # persist hold payload
+        try:
+            hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
+            logger.info("[%s] Hold ready", call_sid)
+        except Exception:
+            logger.exception("[%s] Failed to set hold ready", call_sid)
 
-        # 6. If call already ended, create outbound fallback (best-effort)
+        # If call has ended by now, create fallback outbound call to play response (best-effort).
         try:
             if twilio_client and from_number:
-                call_obj = twilio_client.calls(call_sid).fetch()
-                status = getattr(call_obj, "status", "").lower()
-                if status not in ("in-progress", "ringing", "queued"):
-                    # call ended -> create new outbound call to play reply
-                    if payload.get("tts_url"):
-                        twiml = f"<Response><Play>{payload['tts_url']}</Play></Response>"
+                call = twilio_client.calls(call_sid).fetch()
+                status = getattr(call, "status", "").lower()
+                if status not in ("in-progress", "queued", "ringing"):
+                    # call ended, create outbound fallback to play the reply
+                    twiml = None
+                    if tts_url:
+                        twiml = f"<Response><Play>{tts_url}</Play></Response>"
                     else:
-                        safe = (payload.get("reply_text") or "").replace("&", " and ")
-                        twiml = f"<Response><Say>{safe}</Say></Response>"
+                        safe_text = (reply_text or "Hello. I have a response for you.").replace("&", " and ")
+                        twiml = f"<Response><Say>{safe_text}</Say></Response>"
                     try:
                         created = twilio_client.calls.create(to=from_number, from_=TWILIO_FROM, twiml=twiml)
-                        logger.info("[%s] Created fallback outbound call %s", call_sid, getattr(created, 'sid', 'unknown'))
+                        logger.info("[%s] Created outbound fallback call %s", call_sid, getattr(created, "sid", "unknown"))
                     except Exception:
                         logger.exception("[%s] Failed creating fallback outbound call", call_sid)
         except Exception:
+            # non-fatal
             pass
 
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
         hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
-
-    finally:
-        try:
-            if audio_path and os.path.exists(audio_path):
-                os.unlink(audio_path)
-        except Exception:
-            pass
-
 
 # ---------------- HTTP endpoints ----------------
 @app.post("/recording")
