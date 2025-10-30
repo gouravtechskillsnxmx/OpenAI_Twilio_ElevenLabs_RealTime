@@ -454,6 +454,26 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
 
 # ---------------- HTTP endpoints ----------------
+@app.get("/_debug_hold")
+async def debug_hold(convo_id: str):
+    payload = hold_store.get_ready(convo_id)
+    if not payload:
+        return {"found": False}
+    return {"found": True, "payload": payload}
+
+def get_ready(self, convo_id):
+    try:
+        v = self.redis.get(f"hold:{convo_id}")
+        if v:
+            return json.loads(v)
+    except Exception:
+        logger.warning("Redis unavailable; checking file fallback")
+    fpath = f"/tmp/hold_store/{convo_id}.json"
+    if os.path.exists(fpath):
+        with open(fpath) as f:
+            return json.load(f)
+    return None
+
 @app.post("/recording")
 async def recording_webhook(
     request: Request,
@@ -691,7 +711,6 @@ async def media_stream(ws: WebSocket):
         logger.exception("media-stream error: %s", e)
         if session:
             await session.close()
-
 
 @app.get("/health")
 async def health():
