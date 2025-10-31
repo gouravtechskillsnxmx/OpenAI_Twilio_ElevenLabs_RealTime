@@ -418,97 +418,140 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 
     logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
 
-    def download_bytes_with_retry(url: str, auth=None, timeout: int = 20, attempts: int = 3, backoff: float = 0.6):
-        """
-        Try to GET the URL (streaming) up to `attempts` times.
-        Returns bytes on success, raises Exception after all attempts fail.
-        """
-        last_exc = None
-        # Build candidate list: original URL and, if it has no ext, try .mp3
-        candidates = [url]
-        low = url.lower()
-        if not low.endswith((".mp3", ".wav", ".m4a", ".ogg")):
-            candidates.append(url + ".mp3")
+    import time
+import requests
+from requests.auth import HTTPBasicAuth
 
-        for cand in candidates:
-            for attempt in range(1, attempts + 1):
-                try:
-                    logger.debug("[%s] download attempt %d for %s (auth=%s)", call_sid, attempt, cand, bool(auth))
-                    r = requests.get(cand, auth=auth, timeout=timeout, stream=True)
-                    r.raise_for_status()
-                    # read content in chunks to avoid memory spikes
-                    chunks = []
-                    for chunk in r.iter_content(chunk_size=32 * 1024):
-                        if chunk:
-                            chunks.append(chunk)
-                    return b"".join(chunks)
-                except Exception as ex:
-                    last_exc = ex
-                    logger.debug("[%s] GET %s attempt %d failed: %s", call_sid, cand, attempt, ex)
-                    # brief backoff
-                    time.sleep(backoff * attempt)
-            logger.debug("[%s] candidate exhausted: %s", call_sid, cand)
-
-        # Before failing, attempt HEAD on original url for diagnostics
+# --- NEW: robust downloader with safe retries ---
+def download_bytes_with_retry(url: str, auth: HTTPBasicAuth | None = None, timeout: int = 30,
+                              attempts: int = 3, backoff: float = 0.6, min_size_bytes: int = 1024):
+    """
+    Download bytes from `url` with a couple of safety heuristics:
+      - Try HEAD first to quickly check status (but if HEAD fails, still attempt GET).
+      - Follow redirects (requests.default).
+      - On GET, stream the response and read content.
+      - Retry on transient network errors & server errors (5xx). Raise last exception otherwise.
+      - If content size is suspiciously small (< min_size_bytes), treat as error (server returned HTML error page).
+    Returns: bytes
+    Raises: Exception on terminal failure.
+    """
+    last_exc = None
+    session = requests.Session()
+    for attempt in range(1, attempts + 1):
         try:
-            h = requests.head(url, timeout=5)
-            logger.warning("[%s] HEAD %s -> status=%s", call_sid, url, getattr(h, "status_code", None))
-        except Exception as he:
-            logger.debug("[%s] HEAD failed for diagnostic: %s", call_sid, he)
+            # Try HEAD to check quickly (not all hosts implement HEAD properly)
+            try:
+                h = session.head(url, auth=auth, timeout=(5, timeout), allow_redirects=True)
+                status = getattr(h, "status_code", None)
+                if status is None or status >= 400:
+                    # log but don't abort — some servers return 404 for HEAD even though GET works
+                    logger.warning("HEAD %s -> status=%s (attempt %d/%d)", url, status, attempt, attempts)
+                else:
+                    logger.info("HEAD %s -> %s", url, status)
+            except Exception as e_head:
+                # HEAD failed — log and continue to GET
+                logger.warning("HEAD failed for %s (attempt %d/%d): %s", url, attempt, attempts, e_head)
 
-        raise last_exc if last_exc else RuntimeError("download failed")
+            # Now attempt GET
+            logger.info("GET %s (attempt %d/%d)", url, attempt, attempts)
+            r = session.get(url, auth=auth, timeout=(5, timeout), stream=True, allow_redirects=True)
+            # raise for status (will throw HTTPError on 4xx/5xx)
+            r.raise_for_status()
 
+            # read content
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    chunks.append(chunk)
+                    total += len(chunk)
+            content = b"".join(chunks)
+            r.close()
+
+            # sanity check size
+            if len(content) < min_size_bytes:
+                # small responses are often HTML error pages or truncated responses
+                logger.warning("Downloaded content too small (%d bytes) from %s", len(content), url)
+                raise RuntimeError(f"Downloaded content too small ({len(content)} bytes)")
+
+            logger.info("Downloaded %d bytes from %s", len(content), url)
+            return content
+
+        except requests.exceptions.HTTPError as he:
+            # For 4xx, don't retry many times (client error). For 5xx, retry.
+            status = getattr(he.response, "status_code", None) if getattr(he, "response", None) else None
+            logger.warning("HTTP error GET %s -> %s (attempt %d/%d)", url, status, attempt, attempts)
+            last_exc = he
+            # If it's a server error (5xx), we should retry. For 404/401/422 etc, no point in retrying repeatedly.
+            if status and 500 <= status < 600:
+                # retry
+                pass
+            else:
+                # terminal for client errors
+                break
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ChunkedEncodingError) as neterr:
+            logger.warning("Network error while GET %s (attempt %d/%d): %s", url, attempt, attempts, neterr)
+            last_exc = neterr
+
+        except Exception as exc:
+            logger.exception("Unexpected error while downloading %s (attempt %d/%d): %s", url, attempt, attempts, exc)
+            last_exc = exc
+
+        # backoff before retry (unless last attempt)
+        if attempt < attempts:
+            sleep_for = backoff * (2 ** (attempt - 1))
+            logger.info("Retrying in %.2fs", sleep_for)
+            time.sleep(sleep_for)
+
+    # After attempts exhausted or terminal client error -> raise last
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("download failed without specific exception")
+
+# --- Updated process_recording_background using the above downloader ---
+async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
+    """
+    Background pipeline:
+     - normalize recording URL
+     - download (with retry)
+     - transcribe (OpenAI)
+     - call agent to get reply
+     - attempt ElevenLabs TTS & upload to S3
+     - persist hold payload (hold_store.set_ready)
+     - if original call ended, create fallback outbound call (best-effort)
+    """
+    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
     try:
-        # Normalize / build download URL (your existing helper)
         url = build_download_url(recording_url)
         logger.info("[%s] Using normalized URL=%s", call_sid, url)
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and "api.twilio.com" in url) else None
 
-        # Use Twilio auth if the URL is Twilio-hosted
-        auth = None
+        # safer download with retries
         try:
-            if TWILIO_SID and TWILIO_TOKEN and ("api.twilio.com" in url or "api-eu.twilio.com" in url):
-                auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN)
-        except Exception:
-            auth = None
-
-        # --- NEW: safer download with retries & fallback candidates ---
-        try:
-            content = download_bytes_with_retry(url, auth=auth, timeout=20, attempts=3, backoff=0.6)
+            content = download_bytes_with_retry(url, auth=auth, timeout=20, attempts=3, backoff=0.6, min_size_bytes=1024)
         except Exception as e:
             logger.exception("[%s] Failed to download recording after retries: %s", call_sid, e)
-            # ensure caller sees a friendly fallback quickly
             try:
-                hold_store.set_ready(call_sid, {
-                    "tts_url": None,
-                    "reply_text": "Sorry — I couldn't retrieve your recording right now. Please try again in a moment."
-                })
+                hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
             except Exception:
                 logger.exception("[%s] Failed to set fallback hold payload after download failure", call_sid)
             return
 
-        # write to temp file (stream-safe)
+        # write to temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        file_path = None
         try:
-            with open(tmp.name, "wb") as fh:
-                fh.write(content)
+            tmp.write(content)
+            tmp.flush()
+            tmp.close()
             file_path = tmp.name
-            logger.info("[%s] saved recording to %s (size=%d bytes)", call_sid, file_path, len(content))
-        except Exception as e:
-            logger.exception("[%s] Error saving downloaded recording: %s", call_sid, e)
+            logger.info("[%s] saved recording to %s", call_sid, file_path)
+        except Exception:
             try:
                 tmp.close()
             except Exception:
                 pass
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
-            try:
-                hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, I couldn't process your recording."})
-            except Exception:
-                logger.exception("[%s] Failed to set fallback after save error", call_sid)
-            return
+            raise
 
         # STT/transcription
         transcript = ""
@@ -519,22 +562,17 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
             transcript = ""
 
-        # cleanup audio file early
+        # cleanup uploaded file
         try:
-            if file_path:
-                os.unlink(file_path)
+            os.unlink(file_path)
         except Exception:
             pass
 
-        # Agent call - may be blocking
+        # Agent call (blocking)
         try:
             agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
-            if isinstance(agent_out, dict):
-                reply_text = agent_out.get("reply_text", "") or ""
-                memory_writes = agent_out.get("memory_writes", []) or []
-            else:
-                reply_text = str(agent_out) or ""
-                memory_writes = []
+            reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
+            memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
         except Exception as e:
             logger.exception("[%s] agent call failed: %s", call_sid, e)
             reply_text = "Sorry, I'm having trouble right now."
@@ -543,7 +581,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         logger.info("[%s] assistant reply (truncated): %s", call_sid,
                     (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
 
-        # Apply memory writes (best-effort)
+        # memory writes (best-effort)
         if memory_writes and isinstance(memory_writes, list):
             for mw in memory_writes:
                 try:
@@ -552,7 +590,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                 except Exception:
                     logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
 
-        # === NEW: Safer ElevenLabs TTS generation and upload ===
+        # ElevenLabs TTS -> upload to S3 (safe)
         tts_url = None
         try:
             audio_bytes = create_tts_elevenlabs(reply_text)
@@ -569,28 +607,25 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         except Exception as e:
             logger.exception("[%s] TTS pipeline error: %s", call_sid, e)
             tts_url = None
-        # === END NEW ===
 
-        # persist hold payload for /hold polling
+        # persist hold payload
         try:
             hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
             logger.info("[%s] Hold ready", call_sid)
         except Exception:
             logger.exception("[%s] Failed to set hold ready", call_sid)
-            # fallback to file persist if hold_store supports it
             try:
                 if hasattr(hold_store, "force_file_fallback"):
                     hold_store.force_file_fallback(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
             except Exception:
                 logger.exception("[%s] fallback persist also failed", call_sid)
 
-        # If call ended by the time we've prepared a reply, make a fallback outbound call (best-effort)
+        # If call ended -> create outbound fallback (best-effort)
         try:
             if twilio_client and from_number:
                 call = twilio_client.calls(call_sid).fetch()
                 status = getattr(call, "status", "").lower()
                 if status not in ("in-progress", "queued", "ringing"):
-                    # call ended; create outbound fallback
                     if tts_url:
                         twiml = f"<Response><Play>{tts_url}</Play></Response>"
                     else:
@@ -602,7 +637,6 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                     except Exception:
                         logger.exception("[%s] Failed creating fallback outbound call", call_sid)
         except Exception:
-            # non-fatal, swallow errors to avoid crashing background
             logger.exception("[%s] error while checking/creating fallback outbound call", call_sid)
 
     except Exception as e:
@@ -611,7 +645,6 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
         except Exception:
             logger.exception("[%s] Failed to set fallback hold ready after unexpected pipeline error", call_sid)
-        return
 
 
 # ---------------- HTTP endpoints ----------------
