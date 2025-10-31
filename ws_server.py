@@ -332,29 +332,120 @@ def transcribe_with_openai(file_path: str) -> str:
     except Exception as e:
         logger.exception("transcribe_with_openai error: %s", e)
         return ""
+# ---------------- helper: build_download_url ----------------
+def build_download_url(recording_url: str) -> str:
+    """
+    Normalize a Twilio/third-party recording URL for downloading audio.
+
+    - If Twilio recordings resource URL (no extension) is passed, prefer the .mp3 variant.
+    - If URL already looks like a direct media link, return it unchanged.
+    - Conservative: if unsure, return original URL (download code will log / fail safely).
+    """
+    try:
+        if not recording_url:
+            return recording_url
+
+        url = recording_url.strip()
+        lower = url.lower()
+
+        # If it already looks like a direct media resource, return as-is.
+        if lower.endswith((".mp3", ".wav", ".m4a", ".ogg", ".opus")):
+            return url
+
+        # Twilio recording resource pattern -> append .mp3 when missing
+        if "api.twilio.com" in lower and "/recordings/" in lower:
+            if not lower.endswith(".mp3"):
+                return url + ".mp3"
+            return url
+
+        # If it's file-examples or common CDN paths, prefer as-is.
+        return url
+
+    except Exception as e:
+        # logger may already exist in your file; use it consistently
+        try:
+            logger.exception("build_download_url failed: %s", e)
+        except Exception:
+            print("build_download_url failed:", e)
+        return recording_url
+# ---------------- end helper ----------------
+import time
+import requests
+from requests.auth import HTTPBasicAuth
+
+def download_bytes_with_retry(url: str, auth: Optional[HTTPBasicAuth] = None, timeout: int = 30, attempts: int = 2, backoff: float = 0.5) -> bytes:
+    """
+    Download URL content with a small retry loop to avoid transient DNS/timeouts.
+    Returns bytes or raises the final exception to be handled by caller.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # stream=False to get full content simply; caller will write file
+            r = requests.get(url, auth=auth, timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            last_exc = e
+            try:
+                logger.warning("download attempt %d/%d failed for %s: %s", attempt, attempts, url, e)
+            except Exception:
+                print(f"download attempt {attempt}/{attempts} failed for {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            else:
+                # raise final exception
+                raise
+    # should never reach here
+    raise last_exc
 
 
 # ---------------- Background pipeline (recording -> agent -> TTS -> hold_store) ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
+    """
+    Background pipeline:
+     - normalize recording URL
+     - download (with small retry)
+     - transcribe (OpenAI)
+     - call agent to get reply
+     - attempt ElevenLabs TTS & upload to S3
+     - persist hold payload (hold_store.set_ready)
+     - if original call ended, create fallback outbound call (best-effort)
+    """
     logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
     try:
         url = build_download_url(recording_url)
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and "api.twilio.com" in url else None
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and "api.twilio.com" in url) else None
+
+        # --- NEW: safer download with 1 retry ---
         try:
-            r = requests.get(url, auth=auth, timeout=30)
-            r.raise_for_status()
+            content = download_bytes_with_retry(url, auth=auth, timeout=30, attempts=2, backoff=0.5)
         except Exception as e:
-            logger.exception("[%s] Failed to download recording: %s", call_sid, e)
-            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            logger.exception("[%s] Failed to download recording after retries: %s", call_sid, e)
+            # ensure caller sees a friendly fallback
+            try:
+                hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            except Exception:
+                logger.exception("[%s] Failed to set fallback hold payload after download failure", call_sid)
             return
 
+        # write to temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(r.content)
-        tmp.flush()
-        tmp.close()
-        file_path = tmp.name
-        logger.info("[%s] saved recording to %s", call_sid, file_path)
+        try:
+            tmp.write(content)
+            tmp.flush()
+            tmp.close()
+            file_path = tmp.name
+            logger.info("[%s] saved recording to %s", call_sid, file_path)
+        except Exception:
+            # ensure file closed and removed on error
+            try:
+                tmp.close()
+            except Exception:
+                pass
+            raise
 
+        # STT/transcription
         transcript = ""
         try:
             transcript = transcribe_with_openai(file_path)
@@ -363,13 +454,13 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
             transcript = ""
 
-        # cleanup audio file
+        # cleanup uploaded file
         try:
             os.unlink(file_path)
         except Exception:
             pass
 
-        # Agent call - expects structured dict
+        # Agent call - may be blocking (existing code)
         try:
             agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
             reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
@@ -379,11 +470,9 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             reply_text = "Sorry, I'm having trouble right now."
             memory_writes = []
 
-        logger.info("[%s] assistant reply (truncated): %s",
-                    call_sid,
-                    (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
+        logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
 
-        # If agent returned memory writes, persist them (best-effort)
+        # Apply memory writes (best-effort)
         if memory_writes and isinstance(memory_writes, list):
             for mw in memory_writes:
                 try:
@@ -395,46 +484,43 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         # === NEW: Safer ElevenLabs TTS generation and upload ===
         tts_url = None
         try:
-            # create_tts_elevenlabs returns raw audio bytes or None on failure
             audio_bytes = create_tts_elevenlabs(reply_text)
             if not audio_bytes:
-                logger.warning("[%s] ElevenLabs TTS returned no audio bytes, falling back to text", call_sid)
+                logger.warning("[%s] ElevenLabs TTS returned no bytes; falling back to text", call_sid)
                 tts_url = None
             else:
+                # upload bytes to S3 (make sure upload_bytes_to_s3 exists)
                 try:
                     tts_url = upload_bytes_to_s3(audio_bytes, filename=f"{call_sid}.mp3")
                     logger.info("[%s] TTS uploaded to S3: %s", call_sid, tts_url)
-                except Exception as e:
-                    logger.exception("[%s] Failed to upload TTS to S3: %s", call_sid, e)
+                except Exception:
+                    logger.exception("[%s] Upload TTS to S3 failed; will fallback to text reply", call_sid)
                     tts_url = None
-        except requests.HTTPError as he:
-            # requests errors from create_tts_elevenlabs (if it uses requests internally)
-            try:
-                content = he.response.text if getattr(he, "response", None) is not None else None
-            except Exception:
-                content = None
-            logger.error("[%s] ElevenLabs HTTP error: %s; body: %s", call_sid, str(he), content)
-            tts_url = None
         except Exception as e:
             logger.exception("[%s] TTS pipeline error: %s", call_sid, e)
             tts_url = None
         # === END NEW ===
 
-        # persist hold payload
+        # persist hold payload for /hold polling
         try:
             hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
             logger.info("[%s] Hold ready", call_sid)
         except Exception:
             logger.exception("[%s] Failed to set hold ready", call_sid)
+            # As a last resort, write local file fallback (if your hold_store supports it)
+            try:
+                if hasattr(hold_store, "force_file_fallback"):
+                    hold_store.force_file_fallback(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
+            except Exception:
+                logger.exception("[%s] fallback persist also failed", call_sid)
 
-        # If call has ended by now, create fallback outbound call to play response (best-effort).
+        # If call ended by the time we've prepared a reply, make a fallback outbound call (best-effort)
         try:
             if twilio_client and from_number:
                 call = twilio_client.calls(call_sid).fetch()
                 status = getattr(call, "status", "").lower()
                 if status not in ("in-progress", "queued", "ringing"):
-                    # call ended, create outbound fallback to play the reply
-                    twiml = None
+                    # call ended; create outbound fallback
                     if tts_url:
                         twiml = f"<Response><Play>{tts_url}</Play></Response>"
                     else:
@@ -446,12 +532,15 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                     except Exception:
                         logger.exception("[%s] Failed creating fallback outbound call", call_sid)
         except Exception:
-            # non-fatal
-            pass
+            # non-fatal, swallow errors to avoid crashing background
+            logger.exception("[%s] error while checking/creating fallback outbound call", call_sid)
 
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
-        hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
+        try:
+            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
+        except Exception:
+            logger.exception("[%s] Failed to set fallback hold ready after unexpected pipeline error", call_sid)
 
 # ---------------- HTTP endpoints ----------------
 @app.get("/_debug_hold")
