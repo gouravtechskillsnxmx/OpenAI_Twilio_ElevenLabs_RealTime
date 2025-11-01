@@ -697,33 +697,43 @@ async def recording_webhook(
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
-    """Twilio will poll /hold until we set the reply in hold_store. """
+    """
+    Twilio polls this endpoint while background prepares the reply.
+    When ready, we <Play> the TTS URL if playable else <Say> the reply_text.
+    If not ready, we return a short pause + redirect so Twilio will poll again.
+    """
     try:
         ready = hold_store.get_ready(convo_id)
         resp = VoiceResponse()
+
         if ready:
-            tts_url = _unescape_url(ready.get("tts_url")) if isinstance(ready, dict) else None
-            if tts_url and tts_url.startswith("file://"):
-                # local file -> Twilio can't use file:// in production; fall back to Say
-                txt = ready.get("reply_text", "") if isinstance(ready, dict) else ""
-                resp.say(txt or "Sorry, I don't have an answer right now.", voice="alice")
-            elif tts_url and is_url_playable(tts_url):
+            # ready payload expected: {"tts_url": <str|null>, "reply_text": <str>}
+            tts_url = _unescape_url(ready.get("tts_url")) if ready else None
+            reply_text = (ready.get("reply_text") or "").strip() if ready else ""
+            # If we have a playable URL, prefer <Play> (audio). Else <Say>.
+            if tts_url and is_url_playable(tts_url):
                 resp.play(tts_url)
             else:
-                txt = ready.get("reply_text", "") if isinstance(ready, dict) else ""
-                resp.say(txt or "Sorry, I don't have an answer right now.", voice="alice")
-            # after reply, record again for continued conversation
-            base = str(request.base_url).rstrip("/")
-            resp.record(max_length=30, action=f"{base}/recording", play_beep=True, timeout=2)
+                speak = reply_text or "Sorry, I don't have an answer right now."
+                resp.say(speak, voice="alice")
+
+            # After delivering reply, offer caller a chance to continue (record again).
+            # Short max_length prevents long second recordings.
+            resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
             return Response(content=str(resp), media_type="text/xml")
 
-        # not ready -> keep caller on hold and redirect back to /hold
-        base = str(request.base_url).rstrip("/")
-        redirect_url = f"{base}/hold?convo_id={convo_id}"
+        # Not ready -> ask caller to hold briefly and redirect back to this endpoint.
+        # Use x-forwarded-proto if present to build an HTTPS-aware redirect URL.
+        proto = request.headers.get("x-forwarded-proto", "https")
+        host = request.headers.get("host", request.url.hostname)
+        redirect_url = f"{proto}://{host}/hold?convo_id={convo_id}"
+
+        # Shorter pause to reduce perceived latency (2s instead of 8s)
         resp.say("Please hold while I prepare your response.", voice="alice")
-        resp.pause(length=8)
+        resp.pause(length=2)
         resp.redirect(redirect_url)
         return Response(content=str(resp), media_type="text/xml")
+
     except Exception as e:
         logger.exception("Hold error: %s", e)
         resp = VoiceResponse()
