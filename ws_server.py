@@ -64,6 +64,44 @@ try:
 except Exception:
     twilio_client = None
 
+
+# --- TwiML helpers (paste near top, with your imports) ---
+from fastapi import Response
+from twilio.twiml.voice_response import VoiceResponse
+import urllib.parse
+import logging
+
+logger = logging.getLogger("ws_server")
+
+def twiml(resp: VoiceResponse) -> Response:
+    """
+    Convert a twilio VoiceResponse into a FastAPI Response with proper media type.
+    Use this anywhere you previously returned Response(content=str(...), media_type="text/xml").
+    """
+    return Response(content=str(resp), media_type="text/xml")
+
+def recording_callback_url_from_request(request):
+    """
+    Build safe recording callback URL from request base_url.
+    This avoids missing helper functions like `recording_callback_url()` that cause NameError.
+    """
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/recording"
+
+def safe_say_and_record_action(reply_text: str, request, max_length=30, play_beep=True, timeout=2):
+    """
+    Convenience: return a VoiceResponse that Says `reply_text` then Record(...) pointing at /recording.
+    """
+    vr = VoiceResponse()
+    if not reply_text:
+        reply_text = "Sorry, I don't have an answer right now."
+    vr.say(reply_text, voice="alice")
+    action_url = recording_callback_url_from_request(request)
+    vr.record(max_length=max_length, action=action_url, play_beep=play_beep, timeout=timeout)
+    return vr
+# --- end TwiML helpers ---
+
+
 # ---------------- HoldStore (Redis -> file -> memory fallback) ----------------
 class HoldStore:
     def __init__(self, redis_url: Optional[str] = None, file_dir: str = "/tmp/hold_store"):
@@ -702,54 +740,47 @@ async def recording_webhook(
     return Response(content=str(resp), media_type="text/xml")
 
 
+from fastapi import Request, Query  # ensure these imports exist
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
     """
-    Twilio will repeatedly request /hold while the background prepares the response.
-    When ready, we either <Play> the presigned S3 URL (if reachable) or <Say> the reply_text.
+    Twilio polls /hold until background sets hold_store ready payload.
+    Uses twiml(resp) helper to produce proper TwiML responses and avoids NameError.
     """
     try:
+        logger.debug("Hold requested: convo_id=%s base=%s", convo_id, str(request.base_url))
         ready = hold_store.get_ready(convo_id)
-        resp = VoiceResponse()
 
         if ready:
-            tts_url = _unescape_url(ready.get("tts_url"))
-            if tts_url and is_url_playable(tts_url):
-                resp.play(tts_url)
+            tts_url = ready.get("tts_url")
+            reply_text = ready.get("reply_text", "") or ""
+            logger.info("Hold ready for %s: tts_url=%s reply_text_len=%d", convo_id, tts_url, len(reply_text))
+            vr = VoiceResponse()
+            if tts_url and is_url_playable(_unescape_url(tts_url)):
+                vr.play(_unescape_url(tts_url))
             else:
-                # Fallback to speak text (avoid empty text)
-                txt = ready.get("reply_text", "")
-                if not txt:
-                    txt = "Sorry, I don't have an answer right now."
-                resp.say(txt, voice="alice")
+                vr.say(reply_text or "Sorry, I don't have an answer right now.", voice="alice")
+            # after answer, ask for new input (record)
+            action_url = recording_callback_url_from_request(request)
+            vr.record(max_length=30, action=action_url, play_beep=True, timeout=2)
+            return twiml(vr)
 
-            # After playing/saying the reply, prompt for more (records again).
-            # Use the helper to build the absolute /recording callback URL.
-            try:
-                action_url = recording_callback_url(request)
-            except Exception as e:
-                logger.exception("Failed to build recording callback URL: %s", e)
-                action_url = "/recording"  # fallback (relative)
-
-            resp.record(max_length=30, action=action_url, play_beep=True, timeout=2)
-            return Response(content=str(resp), media_type="text/xml")
-
-        # Not ready -> keep caller on hold and redirect back to /hold so Twilio polls again.
+        # not ready -> keep caller on hold, redirect back so Twilio polls again
+        vr = VoiceResponse()
+        vr.say("Please hold while I prepare your response.", voice="alice")
+        vr.pause(length=2)   # short while testing; set back to 8 in production
         base = str(request.base_url).rstrip("/")
-        redirect_url = f"{base}/hold?convo_id={convo_id}"
-
-        resp.say("Please hold while I prepare your response.", voice="alice")
-        # pause for a bit, then redirect back to /hold. Twilio will repeat until background sets the hold.
-        resp.pause(length=8)
-        resp.redirect(redirect_url)
-        return Response(content=str(resp), media_type="text/xml")
+        redirect_url = f"{base}/hold?convo_id={urllib.parse.quote_plus(convo_id)}"
+        vr.redirect(redirect_url)
+        return twiml(vr)
 
     except Exception as e:
-        logger.exception("Hold error: %s", e)
-        resp = VoiceResponse()
-        resp.say("An error occurred.", voice="alice")
-        return Response(content=str(resp), media_type="text/xml")
+        logger.exception("Hold error (convo_id=%s): %s", convo_id, e)
+        vr = VoiceResponse()
+        vr.say("An error occurred while processing your request. Please try again later.", voice="alice")
+        vr.hangup()
+        return twiml(vr)
 
 
 # ---------------- Minimal Twilio Media Streams websocket handler (realtime) ----------------
