@@ -509,6 +509,14 @@ def download_bytes_with_retry(url: str, auth: HTTPBasicAuth | None = None, timeo
         raise last_exc
     raise RuntimeError("download failed without specific exception")
 
+def recording_callback_url(request: Request) -> str:
+    """
+    Return the absolute URL for the /recording endpoint based on the incoming request.
+    Use request.base_url so it respects the current host (Render, local, etc).
+    """
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/recording"
+
 # --- Updated process_recording_background using the above downloader ---
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     """
@@ -698,39 +706,42 @@ async def recording_webhook(
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
     """
-    Twilio polls this endpoint while background prepares the reply.
-    When ready, we <Play> the TTS URL if playable else <Say> the reply_text.
-    If not ready, we return a short pause + redirect so Twilio will poll again.
+    Twilio will repeatedly request /hold while the background prepares the response.
+    When ready, we either <Play> the presigned S3 URL (if reachable) or <Say> the reply_text.
     """
     try:
         ready = hold_store.get_ready(convo_id)
         resp = VoiceResponse()
 
         if ready:
-            # ready payload expected: {"tts_url": <str|null>, "reply_text": <str>}
-            tts_url = _unescape_url(ready.get("tts_url")) if ready else None
-            reply_text = (ready.get("reply_text") or "").strip() if ready else ""
-            # If we have a playable URL, prefer <Play> (audio). Else <Say>.
+            tts_url = _unescape_url(ready.get("tts_url"))
             if tts_url and is_url_playable(tts_url):
                 resp.play(tts_url)
             else:
-                speak = reply_text or "Sorry, I don't have an answer right now."
-                resp.say(speak, voice="alice")
+                # Fallback to speak text (avoid empty text)
+                txt = ready.get("reply_text", "")
+                if not txt:
+                    txt = "Sorry, I don't have an answer right now."
+                resp.say(txt, voice="alice")
 
-            # After delivering reply, offer caller a chance to continue (record again).
-            # Short max_length prevents long second recordings.
-            resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
+            # After playing/saying the reply, prompt for more (records again).
+            # Use the helper to build the absolute /recording callback URL.
+            try:
+                action_url = recording_callback_url(request)
+            except Exception as e:
+                logger.exception("Failed to build recording callback URL: %s", e)
+                action_url = "/recording"  # fallback (relative)
+
+            resp.record(max_length=30, action=action_url, play_beep=True, timeout=2)
             return Response(content=str(resp), media_type="text/xml")
 
-        # Not ready -> ask caller to hold briefly and redirect back to this endpoint.
-        # Use x-forwarded-proto if present to build an HTTPS-aware redirect URL.
-        proto = request.headers.get("x-forwarded-proto", "https")
-        host = request.headers.get("host", request.url.hostname)
-        redirect_url = f"{proto}://{host}/hold?convo_id={convo_id}"
+        # Not ready -> keep caller on hold and redirect back to /hold so Twilio polls again.
+        base = str(request.base_url).rstrip("/")
+        redirect_url = f"{base}/hold?convo_id={convo_id}"
 
-        # Shorter pause to reduce perceived latency (2s instead of 8s)
         resp.say("Please hold while I prepare your response.", voice="alice")
-        resp.pause(length=2)
+        # pause for a bit, then redirect back to /hold. Twilio will repeat until background sets the hold.
+        resp.pause(length=8)
         resp.redirect(redirect_url)
         return Response(content=str(resp), media_type="text/xml")
 
