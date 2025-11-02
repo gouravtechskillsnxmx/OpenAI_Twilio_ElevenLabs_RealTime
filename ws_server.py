@@ -9,7 +9,6 @@ from twilio.twiml.voice_response import VoiceResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ws_server")
 
-# ==== CONFIG ====
 # ==== CONFIG & ENV ====
 from dotenv import load_dotenv
 load_dotenv()  # safe even if no .env file locally
@@ -27,8 +26,10 @@ TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM = os.getenv("TWILIO_FROM", "+15312303465")
 
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openai-twilio-elevenlabs-realtime.onrender.com").rstrip("/")
-
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://openai-twilio-elevenlabs-realtime.onrender.com"
+).rstrip("/")
 
 # ==== APP ====
 app = FastAPI()
@@ -45,6 +46,11 @@ def recording_callback_url(request: Request) -> str:
 # ==== Simple hold store ====
 _hold: Dict[str, Dict] = {}
 _hold_lock = asyncio.Lock()
+
+# ---------- NEW: friendly root (avoids 404/noisy health checks) ----------
+@app.get("/")
+async def root():
+    return PlainTextResponse("ok: /twiml for Twilio, /health for health", status_code=200)
 
 # ========== ROUTES ==========
 
@@ -86,20 +92,22 @@ async def recording_webhook(
     After caller speaks, Twilio hits this endpoint with RecordingUrl.
     We start background processing and then place the caller on hold/poll loop.
     """
+    method = request.method
     call_sid = CallSid or q_CallSid
     from_num = From or q_From
     rec_url = RecordingUrl or q_RecordingUrl
 
     if not call_sid or not rec_url:
-        # Always return valid TwiML to avoid Twilio 11200 alarms
-        logger.warning("recording_webhook missing fields: CallSid=%s, RecordingUrl=%s", call_sid, rec_url)
+        logger.warning("recording_webhook(%s) missing fields: CallSid=%s, RecordingUrl=%s",
+                       method, call_sid, rec_url)
         vr = VoiceResponse()
         vr.say("Sorry, we couldn't retrieve your recording. Please try again.", voice="alice")
         # Re-arm recording to keep the call usable instead of failing
         vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
         return twiml(vr)
 
-    logger.info("Recording webhook: CallSid=%s From=%s RecordingUrl=%s", call_sid, from_num, rec_url)
+    logger.info("Recording webhook(%s): CallSid=%s From=%s RecordingUrl=%s",
+                method, call_sid, from_num, rec_url)
 
     # Fire the background worker
     asyncio.create_task(process_recording_background(call_sid, rec_url, from_num))
@@ -109,6 +117,11 @@ async def recording_webhook(
     vr.say("Got it. Please hold while I prepare your response.", voice="alice")
     vr.redirect(f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(call_sid)}")
     return twiml(vr)
+
+# ---------- NEW: handle OPTIONS /recording (some edges/proxies probe) ----------
+@app.options("/recording")
+async def recording_options():
+    return PlainTextResponse("", status_code=200)
 
 @app.post("/_test_set_hold")
 async def test_set_hold(convo_id: str = Query(...), reply_text: str = Query("Hello from test"), tts_url: Optional[str] = Query(None)):
