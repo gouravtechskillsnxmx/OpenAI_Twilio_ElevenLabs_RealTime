@@ -73,6 +73,38 @@ import logging
 
 logger = logging.getLogger("ws_server")
 
+
+from fastapi import FastAPI, Response, Request
+from twilio.twiml.voice_response import VoiceResponse
+
+app = FastAPI()
+
+@app.post("/twiml")
+@app.get("/twiml")
+async def twiml_entry(request: Request):
+    """
+    Main Twilio entrypoint webhook. Twilio calls this when a call is answered.
+    Returns TwiML instructing Twilio what to do.
+    """
+    try:
+        # Example: initial greeting + record message
+        vr = VoiceResponse()
+        vr.say("Hello! Please leave your message after the beep.", voice="alice")
+        
+        base = str(request.base_url).rstrip("/")
+        action_url = f"{base}/recording"
+        
+        vr.record(max_length=30, play_beep=True, action=action_url, timeout=3)
+        return Response(content=str(vr), media_type="text/xml")
+
+    except Exception as e:
+        print("Twiml error:", e)
+        error_vr = VoiceResponse()
+        error_vr.say("An application error has occurred. Goodbye.", voice="alice")
+        error_vr.hangup()
+        return Response(content=str(error_vr), media_type="text/xml")
+
+
 def twiml(resp: VoiceResponse) -> Response:
     """
     Convert a twilio VoiceResponse into a FastAPI Response with proper media type.
