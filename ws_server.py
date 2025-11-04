@@ -1,17 +1,26 @@
 # ws_server.py — Twilio TwiML + recording webhook + hold loop (FastAPI)
 
-import os, asyncio, logging, urllib.parse
+import os
+import asyncio
+import logging
+import time
+import urllib.parse
 from typing import Optional, Dict
+
 from fastapi import FastAPI, Request, Form, Query
 from fastapi.responses import Response, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
 
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ws_server")
 
-# ==== CONFIG & ENV ====
-from dotenv import load_dotenv
-load_dotenv()  # safe even if no .env file locally
+# ---------- Config & Env ----------
+try:
+    from dotenv import load_dotenv  # optional convenience when running locally
+    load_dotenv()
+except Exception:
+    pass
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
@@ -28,36 +37,91 @@ TWILIO_FROM = os.getenv("TWILIO_FROM", "+15312303465")
 
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "https://openai-twilio-elevenlabs-realtime.onrender.com"
+    "https://openai-twilio-elevenlabs-realtime.onrender.com",
 ).rstrip("/")
 
-# ==== APP ====
+# ---------- FastAPI ----------
 app = FastAPI()
 
-# ==== TwiML helpers ====
+# ---------- In-memory state (de-bounce & turns) ----------
+_state: Dict[str, Dict] = {}  # call_sid -> {"last_rec_sid": str, "last_at": float, "turn": int}
+_state_lock = asyncio.Lock()
+
+MIN_DURATION_SECONDS = 2            # ignore recordings shorter than this
+RECORDING_COOLDOWN_SECONDS = 2.0    # ignore recordings that arrive too quickly
+
+async def should_ignore_recording(call_sid: str,
+                                  rec_sid: Optional[str],
+                                  rec_duration: Optional[str]) -> bool:
+    """
+    Returns True if this recording should be ignored (too short, duplicate, too soon).
+    """
+    now = time.time()
+    async with _state_lock:
+        st = _state.get(call_sid, {"last_rec_sid": None, "last_at": 0.0, "turn": 0})
+
+        # Too short?
+        if rec_duration is not None:
+            try:
+                dur = int(rec_duration)
+                if dur < MIN_DURATION_SECONDS:
+                    logger.info("[%s] Ignoring recording: duration=%ss < %ss",
+                                call_sid, dur, MIN_DURATION_SECONDS)
+                    return True
+            except Exception:
+                pass
+
+        # Duplicate RecordingSid?
+        if rec_sid and st.get("last_rec_sid") == rec_sid:
+            logger.info("[%s] Ignoring duplicate RecordingSid=%s", call_sid, rec_sid)
+            return True
+
+        # Too soon?
+        if now - float(st.get("last_at", 0.0)) < RECORDING_COOLDOWN_SECONDS:
+            logger.info("[%s] Ignoring recording: cooldown %.1fs not elapsed",
+                        call_sid, RECORDING_COOLDOWN_SECONDS)
+            return True
+
+        # Acceptable — tentatively update last seen info
+        if rec_sid:
+            st["last_rec_sid"] = rec_sid
+        st["last_at"] = now
+        _state[call_sid] = st
+        return False
+
+# ---------- TwiML helpers ----------
 def twiml(resp: VoiceResponse) -> Response:
-    """Return VoiceResponse with proper media type so Twilio accepts it."""
+    """
+    Convert a twilio VoiceResponse into a FastAPI Response with proper media type.
+    """
     return Response(content=str(resp), media_type="text/xml")
 
 def recording_callback_url(request: Request) -> str:
-    """Absolute URL for /recording on this service."""
+    """
+    Absolute callback URL for /recording on this service.
+    """
     return f"{str(request.base_url).rstrip('/')}/recording"
 
-# ==== Simple hold store ====
+# ---------- Simple in-memory hold store ----------
 _hold: Dict[str, Dict] = {}
 _hold_lock = asyncio.Lock()
 
-# ---------- NEW: friendly root (avoids 404/noisy health checks) ----------
+# ---------- Friendly root / health ----------
 @app.get("/")
 async def root():
     return PlainTextResponse("ok: /twiml for Twilio, /health for health", status_code=200)
 
-# ========== ROUTES ==========
+@app.get("/health")
+async def health():
+    return PlainTextResponse("ok", status_code=200)
 
+# ---------- Initial TwiML (GET and POST) ----------
 @app.get("/twiml")
 @app.post("/twiml")
 async def twiml_entry(request: Request):
-    """Initial TwiML: greet and start recording, then send to /recording."""
+    """
+    Greet the caller, then record and POST the result to /recording.
+    """
     try:
         vr = VoiceResponse()
         vr.say("Hello! Please leave your message after the beep.", voice="alice")
@@ -75,69 +139,96 @@ async def twiml_entry(request: Request):
         vr.hangup()
         return twiml(vr)
 
-# --- Twilio normally POSTS here; we also accept GET as a safety net ---
+# ---------- Recording webhook (accept POST and GET; plus OPTIONS to avoid 405) ----------
+@app.options("/recording")
+async def recording_options():
+    # Some proxies pre-flight or probe; just say OK
+    return PlainTextResponse("", status_code=200)
+
 @app.post("/recording")
 @app.get("/recording")
 async def recording_webhook(
     request: Request,
+    # Form (Twilio default for POST)
     CallSid: Optional[str] = Form(None),
     From: Optional[str] = Form(None),
     RecordingUrl: Optional[str] = Form(None),
-    # Query fallbacks (if Twilio/edge sends GET)
+    RecordingSid: Optional[str] = Form(None),
+    RecordingDuration: Optional[str] = Form(None),
+    # Query fallbacks (Twilio sometimes does GET with query params)
     q_CallSid: Optional[str] = Query(None, alias="CallSid"),
     q_From: Optional[str] = Query(None, alias="From"),
     q_RecordingUrl: Optional[str] = Query(None, alias="RecordingUrl"),
+    q_RecordingSid: Optional[str] = Query(None, alias="RecordingSid"),
+    q_RecordingDuration: Optional[str] = Query(None, alias="RecordingDuration"),
 ):
-    """
-    After caller speaks, Twilio hits this endpoint with RecordingUrl.
-    We start background processing and then place the caller on hold/poll loop.
-    """
-    method = request.method
+    method = request.method.upper()
+
     call_sid = CallSid or q_CallSid
     from_num = From or q_From
-    rec_url = RecordingUrl or q_RecordingUrl
+    rec_url  = RecordingUrl or q_RecordingUrl
+    rec_sid  = RecordingSid or q_RecordingSid
+    rec_dur  = RecordingDuration or q_RecordingDuration
 
     if not call_sid or not rec_url:
-        logger.warning("recording_webhook(%s) missing fields: CallSid=%s, RecordingUrl=%s",
-                       method, call_sid, rec_url)
+        logger.warning("Recording webhook(%s): missing CallSid or RecordingUrl", method)
         vr = VoiceResponse()
-        vr.say("Sorry, we couldn't retrieve your recording. Please try again.", voice="alice")
-        # Re-arm recording to keep the call usable instead of failing
-        vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
+        vr.say("We did not get your message. Please try again.", voice="alice")
+        vr.record(
+            max_length=30,
+            play_beep=True,
+            timeout=3,
+            action=recording_callback_url(request),
+        )
         return twiml(vr)
 
     logger.info("Recording webhook(%s): CallSid=%s From=%s RecordingUrl=%s",
                 method, call_sid, from_num, rec_url)
 
-    # Fire the background worker
+    # De-bounce noisy loops
+    if await should_ignore_recording(call_sid, rec_sid, rec_dur):
+        # Quietly re-arm the recorder without speaking again
+        vr = VoiceResponse()
+        vr.pause(length=1)
+        vr.record(
+            max_length=30,
+            play_beep=True,
+            timeout=3,
+            action=recording_callback_url(request),
+        )
+        return twiml(vr)
+
+    # Background pipeline (replace with your real STT->Agent->TTS)
     asyncio.create_task(process_recording_background(call_sid, rec_url, from_num))
 
-    # Place the caller into the hold loop
+    # Put caller into the hold loop
     vr = VoiceResponse()
     vr.say("Got it. Please hold while I prepare your response.", voice="alice")
-    vr.redirect(f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(call_sid)}")
+    hold_url = f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(call_sid)}"
+    vr.redirect(hold_url)
     return twiml(vr)
 
-# ---------- NEW: handle OPTIONS /recording (some edges/proxies probe) ----------
-@app.options("/recording")
-async def recording_options():
-    return PlainTextResponse("", status_code=200)
-
+# ---------- Manual test helper to preload hold ----------
 @app.post("/_test_set_hold")
-async def test_set_hold(convo_id: str = Query(...), reply_text: str = Query("Hello from test"), tts_url: Optional[str] = Query(None)):
-    """Manual test helper: preload a reply for /hold without making a call."""
+async def test_set_hold(
+    convo_id: str = Query(...),
+    reply_text: str = Query("Hello from test"),
+    tts_url: Optional[str] = Query(None),
+):
     async with _hold_lock:
         _hold[convo_id] = {"reply_text": reply_text, "tts_url": tts_url}
     return {"ok": True, "convo_id": convo_id, "payload": _hold[convo_id]}
 
+# ---------- Hold loop ----------
 @app.get("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
     """
-    Twilio (or your curl) polls this until background processing delivers a payload.
-    When ready: speak reply (or Play TTS), then re-arm recording to continue the dialog.
-    When not ready: short pause + redirect back to /hold.
+    Twilio hits this repeatedly via <Redirect/> while your background task works.
+    When a payload is available, we deliver it ONCE and immediately re-arm <Record>
+    so the user can speak their next turn without hearing the greeting again.
     """
     try:
+        # Pop once so we don't repeat
         async with _hold_lock:
             payload = _hold.pop(convo_id, None)
 
@@ -145,13 +236,21 @@ async def hold(request: Request, convo_id: str = Query(...)):
             reply_text = payload.get("reply_text") or "Here is your reply."
             tts_url = payload.get("tts_url")
 
+            # Track the turn (for visibility/debug)
+            async with _state_lock:
+                st = _state.get(convo_id, {"turn": 0, "last_at": time.time()})
+                st["turn"] = int(st.get("turn", 0)) + 1
+                st["last_at"] = time.time()
+                _state[convo_id] = st
+                logger.info("[%s] Delivering reply (turn=%s)", convo_id, st["turn"])
+
             vr = VoiceResponse()
             if tts_url:
                 vr.play(tts_url)
             else:
                 vr.say(reply_text, voice="alice")
 
-            # re-arm for the next turn
+            # Re-arm recording for the next user turn (no extra greeting)
             vr.record(
                 max_length=30,
                 play_beep=True,
@@ -160,9 +259,8 @@ async def hold(request: Request, convo_id: str = Query(...)):
             )
             return twiml(vr)
 
-        # Not ready yet → keep caller politely on hold
+        # Nothing ready yet — short wait + redirect back to /hold
         vr = VoiceResponse()
-        vr.say("Please hold while I prepare your response.", voice="alice")
         vr.pause(length=2)
         vr.redirect(f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(convo_id)}")
         return twiml(vr)
@@ -170,29 +268,153 @@ async def hold(request: Request, convo_id: str = Query(...)):
     except Exception as e:
         logger.exception("Hold error: %s", e)
         vr = VoiceResponse()
-        vr.say("An application error has occurred. Goodbye.", voice="alice")
-        vr.hangup()
+        vr.say("An error occurred.", voice="alice")
         return twiml(vr)
 
-# ===== Background pipeline (stub; replace with your real logic) =====
+# ---------- Background pipeline (stub) ----------
+import os, time, asyncio, tempfile, logging, requests
+from typing import Optional
+from requests.auth import HTTPBasicAuth
+
+logger = logging.getLogger("ws_server")
+
+# assume these exist elsewhere in your file:
+# - build_download_url(url: str) -> str
+# - download_bytes_with_retry(url: str, auth=None, timeout=20, attempts=3, backoff=0.6, min_size_bytes=1024) -> bytes
+# - create_tts_elevenlabs(text: str) -> Optional[bytes]   (or return None to fall back to <Say>)
+# - upload_bytes_to_s3(b: bytes, filename: str) -> str    (returns https URL)  [optional for TTS]
+# - _hold: Dict[str, Dict[str, Optional[str]]]
+# - _hold_lock: asyncio.Lock()
+
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     """
-    Simulate STT → LLM → TTS. Replace with your actual pipeline.
-    Ensure you eventually write to _hold[call_sid] for /hold to complete.
+    End-to-end background pipeline:
+      1) normalize RecordingUrl (.mp3 if Twilio)
+      2) download bytes (with Twilio Basic Auth)
+      3) (placeholder) STT -> Agent -> TTS
+      4) set hold payload exactly once so /hold can deliver it
     """
+    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
     try:
-        logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
-        # Simulate work
-        await asyncio.sleep(2)
-        reply_text = "I heard your message. Thanks for calling!"
+        # 1) normalize URL
+        url = build_download_url(recording_url)
+
+        # 2) Twilio media requires Basic Auth
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if url.startswith("https://api.twilio.com/") else None
+
+        # 3) download audio bytes (raise if tiny/metadata)
+        audio_bytes = download_bytes_with_retry(
+            url, auth=auth, timeout=20, attempts=3, backoff=0.6, min_size_bytes=1024
+        )
+        logger.info("[%s] downloaded %d bytes from %s", call_sid, len(audio_bytes), url)
+
+        # Write temp file for STT engines that need a path
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        try:
+            tmp.write(audio_bytes)
+            tmp.flush()
+            tmp.close()
+            audio_path = tmp.name
+        finally:
+            pass
+
+        # 4) --- STT (placeholder) ---
+        # replace with your real transcribe_with_openai(audio_path)
+        # Keep defensive logging so you can see real transcripts.
+        try:
+            # transcript = transcribe_with_openai(audio_path)
+            await asyncio.sleep(0.1)
+            transcript = "(placeholder transcript)"
+            logger.info("[%s] transcript: %s", call_sid, transcript)
+        except Exception as e:
+            logger.exception("[%s] STT failed: %s", call_sid, e)
+            transcript = ""
+
+        # cleanup temp
+        try:
+            os.unlink(audio_path)
+        except Exception:
+            pass
+
+        # 5) --- Agent (placeholder) ---
+        try:
+            # agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
+            await asyncio.sleep(0.1)
+            reply_text = "Thanks! I understood your message."
+            # memory_writes = agent_out.get("memory_writes", []) if isinstance(agent_out, dict) else []
+        except Exception as e:
+            logger.exception("[%s] Agent failed: %s", call_sid, e)
+            reply_text = "Sorry, I'm having trouble right now."
+            # memory_writes = []
+
+        # 6) --- Optional TTS (best-effort) ---
+        tts_url = None
+        try:
+            # If you want to play audio back, synthesize and upload
+            audio_reply = create_tts_elevenlabs(reply_text)
+            if audio_reply:
+                try:
+                    tts_url = upload_bytes_to_s3(audio_reply, filename=f"{call_sid}.mp3")
+                    logger.info("[%s] TTS uploaded: %s", call_sid, tts_url)
+                except Exception as up_e:
+                    logger.exception("[%s] TTS upload failed: %s", call_sid, up_e)
+                    tts_url = None
+        except Exception as tts_e:
+            logger.exception("[%s] TTS pipeline error: %s", call_sid, tts_e)
+            tts_url = None
+
+        # 7) Publish exactly once so /hold returns a single Play/Say, then re-arms <Record/>
         async with _hold_lock:
-            _hold[call_sid] = {"reply_text": reply_text, "tts_url": None}
+            _hold[call_sid] = {"reply_text": reply_text, "tts_url": tts_url}
         logger.info("[%s] Hold ready", call_sid)
+
     except Exception as e:
         logger.exception("[%s] Background error: %s", call_sid, e)
         async with _hold_lock:
             _hold[call_sid] = {"reply_text": "Sorry, something went wrong.", "tts_url": None}
 
-@app.get("/health")
-async def health():
-    return PlainTextResponse("ok")
+
+import re
+from requests.auth import HTTPBasicAuth
+_TWILIO_REC_RE = re.compile(r"https://api\.twilio\.com/2010-04-01/Accounts/[^/]+/Recordings/(RE[a-zA-Z0-9]+)(?:\.(mp3|wav))?$")
+
+def build_download_url(url: str) -> str:
+    """
+    - If this is a Twilio Recording resource URL without an extension, force .mp3
+    - Otherwise return as-is
+    """
+    m = _TWILIO_REC_RE.match(url)
+    if m and not m.group(2):
+        rid = m.group(1)
+        fixed = _TWILIO_REC_RE.sub(lambda _: f"{_.group(0)}.mp3", url)
+        logger.info("Normalized Twilio RecordingUrl -> %s", fixed)
+        return fixed
+    return url
+
+def download_bytes_with_retry(url: str, auth=None, timeout=20, attempts=3, backoff=0.6, min_size_bytes: int = 1024) -> bytes:
+    last_exc = None
+    for i in range(1, attempts + 1):
+        try:
+            # HEAD for quick visibility
+            try:
+                rh = requests.head(url, auth=auth, timeout=timeout, allow_redirects=True)
+                logger.info("HEAD %s -> %s (len=%s, type=%s)", url, rh.status_code, rh.headers.get("Content-Length"), rh.headers.get("Content-Type"))
+            except Exception as he:
+                logger.warning("HEAD failed for %s: %s", url, he)
+
+            r = requests.get(url, auth=auth, timeout=timeout, allow_redirects=True)
+            logger.info("GET %s -> %s (type=%s)", url, r.status_code, r.headers.get("Content-Type"))
+            r.raise_for_status()
+            content = r.content
+
+            if len(content) < min_size_bytes:
+                logger.warning("Downloaded content too small (%d bytes) from %s (first 120 bytes: %r)", len(content), url, content[:120])
+                raise RuntimeError(f"Downloaded content too small ({len(content)} bytes)")
+
+            return content
+        except Exception as e:
+            last_exc = e
+            logger.error("Download attempt %d/%d failed for %s: %s", i, attempts, url, e)
+            if i < attempts:
+                time.sleep(backoff * i)
+    raise last_exc or RuntimeError("download failed")
