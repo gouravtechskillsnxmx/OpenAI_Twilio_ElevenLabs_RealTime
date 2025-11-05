@@ -291,7 +291,12 @@ import boto3
 from urllib.parse import urlparse
 
 # Add these at the top (after imports)
-openai.api_key = OPENAI_API_KEY
+from openai import OpenAI
+import boto3
+import io
+
+# Initialize clients at top
+client = OpenAI(api_key=OPENAI_API_KEY)
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -300,89 +305,85 @@ s3_client = boto3.client(
 ) if AWS_ACCESS_KEY_ID else None
 
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
-    logger.info("[%s] Background start - %s", call_sid, recording_url)
+    logger.info("[%s] Background start", call_sid)
     try:
-        # 1. Normalize + download
+        # 1. Download
         url = build_download_url(recording_url)
         auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if "api.twilio.com" in url else None
         audio_bytes = download_bytes_with_retry(url, auth=auth)
         logger.info("[%s] Downloaded %d bytes", call_sid, len(audio_bytes))
 
-        # Save to temp file
+        # Save temp
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(audio_bytes)
         tmp.close()
         audio_path = tmp.name
 
-        # 2. Transcribe with OpenAI Whisper
+        # 2. Transcribe with OpenAI v1.0+
+        transcript = ""
         try:
-            with open(audio_path, "rb") as f:
-                transcript_resp = openai.Audio.transcribe(
+            with open(audio_path, "rb") as audio_file:
+                transcription = client.audio.transcriptions.create(
                     model="whisper-1",
-                    file=f
+                    file=audio_file
                 )
-            transcript = transcript_resp.get("text", "").strip()
+            transcript = transcription.text.strip()
             logger.info("[%s] Transcript: %s", call_sid, transcript)
         except Exception as e:
             logger.error("[%s] Transcription failed: %s", call_sid, e)
-            transcript = ""
         finally:
             os.unlink(audio_path)
 
-        if not transcript:
-            reply_text = "I didn't catch that. Please try again."
-        else:
-            # 3. Generate reply with GPT-4o-mini
+        # 3. Generate reply
+        reply_text = "I didn't catch that."
+        if transcript:
             try:
-                chat_resp = openai.ChatCompletion.create(
+                chat_completion = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {"role": "system", "content": "You are a helpful voice assistant. Keep replies short and clear."},
+                        {"role": "system", "content": "You are a helpful voice assistant. Keep replies short."},
                         {"role": "user", "content": transcript}
                     ],
                     max_tokens=150
                 )
-                reply_text = chat_resp.choices[0].message.content.strip()
+                reply_text = chat_completion.choices[0].message.content.strip()
                 logger.info("[%s] GPT reply: %s", call_sid, reply_text)
             except Exception as e:
                 logger.error("[%s] GPT failed: %s", call_sid, e)
                 reply_text = "I'm having trouble thinking right now."
 
-        # 4. Optional: ElevenLabs TTS
+        # 4. Optional TTS
         tts_url = None
         if ELEVEN_API_KEY and ELEVEN_VOICE and s3_client and AWS_S3_BUCKET:
             try:
                 tts_resp = requests.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}",
                     headers={"xi-api-key": ELEVEN_API_KEY},
-                    json={"text": reply_text, "voice_settings": {"stability": 0.7, "similarity_boost": 0.8}}
+                    json={"text": reply_text}
                 )
                 tts_resp.raise_for_status()
-                tts_bytes = tts_resp.content
-
-                # Upload to S3
                 key = f"tts/{call_sid}.mp3"
                 s3_client.upload_fileobj(
-                    io.BytesIO(tts_bytes),
+                    io.BytesIO(tts_resp.content),
                     AWS_S3_BUCKET,
                     key,
                     ExtraArgs={"ContentType": "audio/mpeg"}
                 )
-                # Generate public URL (or use presigned)
                 tts_url = f"https://{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
                 logger.info("[%s] TTS uploaded: %s", call_sid, tts_url)
             except Exception as e:
-                logger.warning("[%s] TTS failed, using <Say>: %s", call_sid, e)
+                logger.warning("[%s] TTS failed: %s", call_sid, e)
 
-        # 5. Save to hold store
+        # 5. Save to hold
         async with _hold_lock:
             _hold[call_sid] = {"reply_text": reply_text, "tts_url": tts_url}
         logger.info("[%s] Hold ready", call_sid)
 
     except Exception as e:
-        logger.exception("[%s] Background failed: %s", call_sid, e)
+        logger.exception("[%s] Background error: %s", call_sid, e)
         async with _hold_lock:
             _hold[call_sid] = {"reply_text": "Sorry, something went wrong.", "tts_url": None}
+
 import re
 from requests.auth import HTTPBasicAuth
 _TWILIO_REC_RE = re.compile(r"https://api\.twilio\.com/2010-04-01/Accounts/[^/]+/Recordings/(RE[a-zA-Z0-9]+)(?:\.(mp3|wav))?$")
