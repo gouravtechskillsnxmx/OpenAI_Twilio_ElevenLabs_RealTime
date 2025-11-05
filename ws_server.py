@@ -24,7 +24,7 @@ except Exception:
 
 # NOTE: Per your setup, the correct env var is "OpenAI_Key".
 # We also fall back to "OPENAI_API_KEY" for compatibility.
-OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OpenAI_Key") #or os.getenv("OPENAI_API_KEY")
 
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 ELEVEN_VOICE = os.getenv("ELEVEN_VOICE", "Xb7hH8MSUJpSbSDYk0k2")
