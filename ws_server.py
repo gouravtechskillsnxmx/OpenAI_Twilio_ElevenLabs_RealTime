@@ -2,7 +2,6 @@
 
 import os
 import asyncio
-import base64
 import json
 import logging
 import time
@@ -23,8 +22,12 @@ try:
 except Exception:
     pass
 
+# Prefer your key name, fallback to standard
 OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openai-twilio-elevenlabs-realtime.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://openai-twilio-elevenlabs-realtime.onrender.com"
+).rstrip("/")
 
 # Optional (kept from your file, still usable by legacy flow)
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
@@ -39,10 +42,23 @@ TWILIO_FROM = os.getenv("TWILIO_FROM", "+15312303465")
 
 if not OPENAI_API_KEY:
     logger.warning("No OpenAI key found. Set OpenAI_Key or OPENAI_API_KEY.")
+if not PUBLIC_BASE_URL:
+    logger.warning("PUBLIC_BASE_URL is not set; realtime Twilio <Stream> will fail.")
+
+def _has_openai_key() -> bool:
+    """Runtime check used by endpoints (startup warning above is not enough)."""
+    return bool(os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY"))
+
+def _ws_host_from_public_base() -> Optional[str]:
+    """Render-safe: always derive WS host from PUBLIC_BASE_URL, not request.host."""
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    return base.replace("https://", "").replace("http://", "")
 
 app = FastAPI()
 
-# ----------- Legacy turn-based state (your existing flow) -----------
+# ----------- Legacy turn-based state (kept from your flow) -----------
 _state: Dict[str, Dict] = {}
 _state_lock = asyncio.Lock()
 
@@ -56,12 +72,15 @@ async def should_ignore_recording(call_sid: str, rec_sid: Optional[str], rec_dur
         if rec_duration is not None:
             try:
                 if int(rec_duration) < MIN_DURATION_SECONDS:
+                    logger.info("[%s] ignore: too short (%ss)", call_sid, rec_duration)
                     return True
             except Exception:
                 pass
         if rec_sid and st.get("last_rec_sid") == rec_sid:
+            logger.info("[%s] ignore: duplicate RecordingSid=%s", call_sid, rec_sid)
             return True
         if now - float(st.get("last_at", 0.0)) < RECORDING_COOLDOWN_SECONDS:
+            logger.info("[%s] ignore: cooldown not elapsed", call_sid)
             return True
         if rec_sid:
             st["last_rec_sid"] = rec_sid
@@ -80,7 +99,10 @@ _hold_lock = asyncio.Lock()
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("ok: /twiml (turn-based), /twiml_stream (realtime), /health", status_code=200)
+    return PlainTextResponse(
+        "ok: /twiml (turn-based), /twiml_stream (realtime), /health",
+        status_code=200
+    )
 
 @app.get("/health")
 async def health():
@@ -121,7 +143,6 @@ async def recording_webhook(
     q_RecordingSid: Optional[str] = Query(None, alias="RecordingSid"),
     q_RecordingDuration: Optional[str] = Query(None, alias="RecordingDuration"),
 ):
-    method = request.method.upper()
     call_sid = CallSid or q_CallSid
     from_num = From or q_From
     rec_url  = RecordingUrl or q_RecordingUrl
@@ -187,9 +208,8 @@ async def hold(request: Request, convo_id: str = Query(...)):
         vr.say("An error occurred.", voice="alice")
         return twiml(vr)
 
-# ----------- Background (legacy) stub you already had ----------
-# Implementations omitted for brevity; keep your existing functions
-import re, tempfile, requests
+# ----------- Background (legacy) stub kept -----------
+import re, requests
 from requests.auth import HTTPBasicAuth
 _TWILIO_REC_RE = re.compile(r"https://api\.twilio\.com/2010-04-01/Accounts/[^/]+/Recordings/(RE[a-zA-Z0-9]+)(?:\.(mp3|wav))?$")
 
@@ -223,18 +243,30 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 
 from aiohttp import ClientSession, WSMsgType
 
-# TwiML to start the real-time stream (use this URL as your Twilio Answer URL)
 @app.post("/twiml_stream")
 @app.get("/twiml_stream")
 async def twiml_stream(request: Request):
     vr = VoiceResponse()
+
+    # Hard fail (speak + hang up) if config is missing, to avoid “welcome then drop”.
+    if not _has_openai_key():
+        logger.error("Realtime requested but no OpenAI key set. Set OpenAI_Key or OPENAI_API_KEY.")
+        vr.say("Configuration error. Open A I key is missing. Please try again later.", voice="alice")
+        vr.hangup()
+        return twiml(vr)
+
+    ws_host = _ws_host_from_public_base()
+    if not ws_host:
+        logger.error("Realtime requested but PUBLIC_BASE_URL is not set.")
+        vr.say("Configuration error. Public base URL is not set. Goodbye.", voice="alice")
+        vr.hangup()
+        return twiml(vr)
+
     vr.say("You are connected to the real time assistant.", voice="alice")
-    vr.connect().stream(url=f"wss://{request.url.hostname}{'' if request.url.port in (80, 443, None) else ':'+str(request.url.port)}/twilio-media")
+    # Always use PUBLIC_BASE_URL host for Twilio <Stream> (Render-friendly)
+    vr.connect().stream(url=f"wss://{ws_host}/twilio-media")
     return twiml(vr)
 
-# WebSocket endpoint Twilio connects to
-# Twilio sends JSON frames: "start", "media", "mark", "stop"
-# We relay to OpenAI Realtime and send model audio back as Twilio 'media' frames.
 @app.websocket("/twilio-media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept()
@@ -244,58 +276,64 @@ async def twilio_media_ws(ws: WebSocket):
     # OpenAI Realtime WS client session
     openai_ws = None
     openai_task = None
-    cancel_inflight = asyncio.Event()
 
     async def openai_connect_and_pump():
         nonlocal openai_ws
+        if not OPENAI_API_KEY:
+            logger.error("OPENAI_API_KEY not set — aborting realtime session.")
+            return
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1",
         }
-        # Model can be updated to the latest realtime preview
+        # Update model string as needed to the newest realtime-preview
         url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
         async with ClientSession() as session:
             async with session.ws_connect(url, headers=headers) as ows:
                 openai_ws = ows
 
-                # Configure session audio formats so we avoid conversions:
-                # Input from Twilio: mulaw 8k; Output to Twilio: mulaw 8k
+                # Configure session audio formats to match Twilio (mulaw 8k)
                 await ows.send_json({
                     "type": "session.update",
                     "session": {
                         "input_audio_format": {"type": "mulaw", "sample_rate_hz": 8000},
                         "output_audio_format": {"type": "mulaw", "sample_rate_hz": 8000},
-                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 200, "silence_duration_ms": 600},
-                        "voice": "verse",  # any supported voice
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 200,
+                            "silence_duration_ms": 600
+                        },
+                        "voice": "verse",
                         "instructions": "You are a concise helpful voice agent. Keep answers short.",
                     }
                 })
 
-                # Forward OpenAI audio deltas back to Twilio as 'media' frames
+                # Pump OpenAI -> Twilio
                 async for msg in ows:
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
                         etype = evt.get("type")
-                        # Audio chunks
+
                         if etype == "response.audio.delta":
                             chunk_b64 = evt.get("delta")
-                            if chunk_b64:
+                            if chunk_b64 and not ws.client_state.name == "DISCONNECTED":
                                 await ws.send_text(json.dumps({
                                     "event": "media",
                                     "streamSid": call_info.get("stream_sid"),
                                     "media": {"payload": chunk_b64}
                                 }))
-                        # When model starts speaking, clear cancel flag
-                        elif etype == "response.output_text.delta":
-                            # no-op, just informational
-                            pass
+
                         elif etype == "response.completed":
-                            # One answer finished
-                            cancel_inflight.clear()
+                            # Completed one answer
+                            pass
+
                         elif etype == "error":
-                            logger.error("OpenAI error: %s", evt)
+                            logger.error("OpenAI error event: %s", evt)
+                            break
+
                     elif msg.type == WSMsgType.BINARY:
-                        # Not used in this flow
+                        # Not used
                         pass
                     elif msg.type == WSMsgType.ERROR:
                         logger.error("OpenAI ws error")
@@ -318,43 +356,29 @@ async def twilio_media_ws(ws: WebSocket):
                 call_info["stream_sid"] = frame["start"]["streamSid"]
                 logger.info("Stream started: %s", call_info["stream_sid"])
 
-                # Start a response so realtime model can speak back
-                # (We'll keep appending audio and let VAD/turns control)
-                # Nothing to send yet; the model will respond after enough audio or if we send a text.
-                pass
-
             elif event == "media":
                 # Incoming μ-law 8k audio from Twilio (base64)
                 payload_b64 = frame["media"]["payload"]
 
-                # Initialize OpenAI connection if needed
                 await ensure_openai()
-
-                # Append audio to the model's input buffer
-                # We stream chunks; the server VAD will trigger the model to respond.
-                if openai_ws is not None:
-                    await openai_ws.send_json({
-                        "type": "input_audio_buffer.append",
-                        "audio": payload_b64  # already mulaw 8k as per session.update
-                    })
+                if openai_ws is not None and not openai_ws.closed:
+                    # Append audio & commit; model VAD will decide when to respond
+                    await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": payload_b64})
+                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                    await openai_ws.send_json({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
 
             elif event == "mark":
-                # Client-side markers (rarely needed here)
+                # Optional markers
                 pass
 
             elif event == "stop":
                 logger.info("Stream stopped by Twilio.")
                 break
 
-            # Optional: implement DTMF barge-in or manual cut with a custom signal
-            # If you wanted to force-cancel current model speech mid-way:
-            # await openai_ws.send_json({"type":"response.cancel"})
-
-            # Flush audio packets periodically to indicate chunk boundaries
-            if event == "media" and openai_ws is not None:
-                await openai_ws.send_json({"type": "input_audio_buffer.commit"})
-                # Request a response continuously; model's VAD will decide when to speak
-                await openai_ws.send_json({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
+            # --- Hard barge-in hook (optional) ---
+            # If you want to force-cut current speech on any new user audio:
+            # if event == "media" and openai_ws is not None and not openai_ws.closed:
+            #     await openai_ws.send_json({"type": "response.cancel"})
 
     except WebSocketDisconnect:
         logger.info("Twilio WS disconnected")
