@@ -23,7 +23,7 @@ except Exception:
     pass
 
 # Prefer your key name, fallback to standard
-OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://openai-twilio-elevenlabs-realtime.onrender.com"
@@ -47,7 +47,7 @@ if not PUBLIC_BASE_URL:
 
 def _has_openai_key() -> bool:
     """Runtime check used by endpoints (startup warning above is not enough)."""
-    return bool(os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY"))
+    return bool(os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY"))
 
 def _ws_host_from_public_base() -> Optional[str]:
     """Render-safe: always derive WS host from PUBLIC_BASE_URL, not request.host."""
