@@ -11,6 +11,7 @@ from typing import Optional, Dict
 from fastapi import FastAPI, Request, Form, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ws_server")
@@ -265,6 +266,13 @@ async def twiml_stream(request: Request):
     vr.connect().stream(url=f"wss://{ws_host}/twilio-media")
     return twiml(vr)
 
+# How much audio to accumulate before committing (in bytes)
+# ~120 ms @ 8kHz mulaw = 0.12 * 8000 * 1 = 960 bytes
+COMMIT_BYTES_TARGET = 960
+
+# Track per-stream state
+stream_state: Dict[str, Dict[str, int]] = {}  # {stream_sid: {"accum_bytes": int}}
+
 @app.websocket("/twilio-media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept()
@@ -354,17 +362,35 @@ async def twilio_media_ws(ws: WebSocket):
             if event == "start":
                 call_info["stream_sid"] = frame["start"]["streamSid"]
                 logger.info("Stream started: %s", call_info["stream_sid"])
+                stream_state[call_info["stream_sid"]] = {"accum_bytes": 0}
 
             elif event == "media":
                 # Incoming μ-law 8k audio from Twilio (base64)
                 payload_b64 = frame["media"]["payload"]
+                if not payload_b64:
+                    # empty frame; ignore
+                    continue
 
                 await ensure_openai()
                 if openai_ws is not None and not openai_ws.closed:
                     # Append audio & commit; model VAD will decide when to respond
                     await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": payload_b64})
-                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
-                    await openai_ws.send_json({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
+
+                     # accumulate exact byte-count (base64-decoded length)
+                    try:
+                        raw_len = len(base64.b64decode(payload_b64))
+                    except Exception:
+                    # if decoding fails, fall back to an estimate (not typical)
+                        raw_len = 0
+
+                    sid = call_info.get("stream_sid") or "unknown"
+                    if sid not in stream_state:
+                        stream_state[sid] = {"accum_bytes": 0}
+                        stream_state[sid]["accum_bytes"] += raw_len
+                    if stream_state[sid]["accum_bytes"] >= COMMIT_BYTES_TARGET:    
+                        await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                        await openai_ws.send_json({"type": "response.create", "response": {"modalities": ["text", "audio"]}})
+                        stream_state[sid]["accum_bytes"] = 0
 
             elif event == "mark":
                 # Optional markers
@@ -372,8 +398,10 @@ async def twilio_media_ws(ws: WebSocket):
 
             elif event == "stop":
                 logger.info("Stream stopped by Twilio.")
+                sid = call_info.get("stream_sid")
+                if sid and sid in stream_state:
+                    stream_state.pop(sid, None)
                 break
-
             # --- Hard barge-in hook (optional) ---
             # If you want to force-cut current speech on any new user audio:
             # if event == "media" and openai_ws is not None and not openai_ws.closed:
