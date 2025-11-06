@@ -24,7 +24,7 @@ except Exception:
     pass
 
 OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://your-app.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openai-twilio-elevenlabs-realtime.onrender.com").rstrip("/")
 
 # Optional (kept from your file, still usable by legacy flow)
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
