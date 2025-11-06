@@ -23,11 +23,8 @@ except Exception:
     pass
 
 # Prefer your key name, fallback to standard
-OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
-PUBLIC_BASE_URL = os.getenv(
-    "PUBLIC_BASE_URL",
-    "https://openai-twilio-elevenlabs-realtime.onrender.com"
-).rstrip("/")
+OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # Optional (kept from your file, still usable by legacy flow)
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
@@ -47,7 +44,7 @@ if not PUBLIC_BASE_URL:
 
 def _has_openai_key() -> bool:
     """Runtime check used by endpoints (startup warning above is not enough)."""
-    return bool(os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY"))
+    return bool(os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY"))
 
 def _ws_host_from_public_base() -> Optional[str]:
     """Render-safe: always derive WS host from PUBLIC_BASE_URL, not request.host."""
@@ -97,6 +94,7 @@ def recording_callback_url(request: Request) -> str:
 _hold: Dict[str, Dict] = {}
 _hold_lock = asyncio.Lock()
 
+# -------------------- Health / Root --------------------
 @app.get("/")
 async def root():
     return PlainTextResponse(
@@ -108,7 +106,7 @@ async def root():
 async def health():
     return PlainTextResponse("ok", status_code=200)
 
-# ----------- Legacy turn-based TwiML -----------
+# -------------------- Legacy turn-based TwiML --------------------
 @app.get("/twiml")
 @app.post("/twiml")
 async def twiml_entry(request: Request):
@@ -292,12 +290,12 @@ async def twilio_media_ws(ws: WebSocket):
             async with session.ws_connect(url, headers=headers) as ows:
                 openai_ws = ows
 
-                # Configure session audio formats to match Twilio (mulaw 8k)
+                # Configure session audio formats to match Twilio (μ-law 8k)
                 await ows.send_json({
                     "type": "session.update",
                     "session": {
-                        "input_audio_format": {"type": "mulaw", "sample_rate_hz": 8000},
-                        "output_audio_format": {"type": "mulaw", "sample_rate_hz": 8000},
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -317,7 +315,8 @@ async def twilio_media_ws(ws: WebSocket):
 
                         if etype == "response.audio.delta":
                             chunk_b64 = evt.get("delta")
-                            if chunk_b64 and not ws.client_state.name == "DISCONNECTED":
+                            if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                                # Forward model audio to Twilio stream
                                 await ws.send_text(json.dumps({
                                     "event": "media",
                                     "streamSid": call_info.get("stream_sid"),
@@ -325,7 +324,7 @@ async def twilio_media_ws(ws: WebSocket):
                                 }))
 
                         elif etype == "response.completed":
-                            # Completed one answer
+                            # One answer finished; next user audio will trigger new response
                             pass
 
                         elif etype == "error":
