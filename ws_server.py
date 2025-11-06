@@ -23,7 +23,7 @@ except Exception:
     pass
 
 # Prefer your key name, fallback to standard
-OPENAI_API_KEY = os.getenv("OpenAI_Key") or os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # Optional (kept from your file, still usable by legacy flow)
