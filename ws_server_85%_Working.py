@@ -431,3 +431,4 @@ def download_bytes_with_retry(url: str, auth=None, timeout=20, attempts=3, backo
             if i < attempts:
                 time.sleep(backoff * i)
     raise last_exc or RuntimeError("download failed")
+
